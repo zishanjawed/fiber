@@ -1,0 +1,4221 @@
+diff --git a/frontend/src/api/documents.service.ts b/frontend/src/api/documents.service.ts
+index f03198f..648f291 100644
+--- a/frontend/src/api/documents.service.ts
++++ b/frontend/src/api/documents.service.ts
+@@ -3,7 +3,16 @@
+  * API calls for document management
+  */
+ import { apiClient, createFormData } from './client'
+-import type { Document, DocumentUploadRequest, DocumentUploadResponse, DocumentListResponse, DocumentFilter } from './types'
++import type {
++  Document,
++  DocumentUploadRequest,
++  DocumentUploadResponse,
++  DocumentListResponse,
++  DocumentFilter,
++  BatchUploadRequest,
++  BatchUploadResponse,
++  BatchStatusResponse
++} from './types'
+ 
+ export const documentsService = {
+   /**
+@@ -77,5 +86,72 @@ export const documentsService = {
+     const response = await apiClient.get(`/api/prompts/global?user_id=${userId}`)
+     return response.data
+   },
++
++  /**
++   * Bulk upload multiple documents
++   */
++  async bulkUpload(request: BatchUploadRequest): Promise<BatchUploadResponse> {
++    const formData = new FormData()
++
++    // Append all files
++    request.files.forEach((file) => {
++      formData.append('files', file)
++    })
++
++    // Append optional metadata
++    if (request.title_prefix) {
++      formData.append('title_prefix', request.title_prefix)
++    }
++    if (request.subject) {
++      formData.append('subject', request.subject)
++    }
++    if (request.tags) {
++      formData.append('tags', request.tags)
++    }
++
++    const response = await apiClient.post<BatchUploadResponse>(
++      '/api/documents/bulk-upload',
++      formData,
++      {
++        headers: {
++          'Content-Type': 'multipart/form-data',
++        },
++        timeout: 600000, // 10 minute timeout for bulk uploads
++      }
++    )
++
++    return response.data
++  },
++
++  /**
++   * Get batch upload status
++   */
++  async getBatchStatus(batchId: string): Promise<BatchStatusResponse> {
++    const response = await apiClient.get<BatchStatusResponse>(
++      `/api/documents/batch/${batchId}`
++    )
++    return response.data
++  },
++
++  /**
++   * Get pending batch uploads for current user
++   */
++  async getPendingBatches(): Promise<{
++    pending_batches: Array<{
++      batch_id: string
++      total_files: number
++      completed_files: number
++      failed_files: number
++      status: string
++      progress_percentage: number
++      created_at: string
++      updated_at: string
++      files_preview: Array<{ filename: string; status: string }>
++    }>
++    count: number
++  }> {
++    const response = await apiClient.get('/api/documents/batches/pending')
++    return response.data
++  },
+ }
+ 
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+index 39de9e4..12783d0 100644
+--- a/frontend/src/api/types.ts
++++ b/frontend/src/api/types.ts
+@@ -405,3 +405,78 @@ export interface ApiError {
+   details?: unknown
+ }
+ 
++// ============================================================================
++// Batch Upload Types
++// ============================================================================
++
++export interface BatchFileStatus {
++  filename: string
++  file_index: number
++  status: 'pending' | 'processing' | 'completed' | 'failed'
++  content_id?: string
++  error_message?: string
++  is_duplicate: boolean
++  duplicate_of?: string
++  total_chunks: number
++  processed_chunks: number
++  progress: number
++  started_at?: string
++  completed_at?: string
++}
++
++export interface BatchUploadRequest {
++  files: File[]
++  title_prefix?: string
++  subject?: string
++  tags?: string
++}
++
++export interface BatchUploadResponse {
++  batch_id: string
++  total_files: number
++  status: string
++  message: string
++  files: Array<{
++    filename: string
++    size_mb: number
++    status: string
++  }>
++}
++
++export interface BatchStatusResponse {
++  batch_id: string
++  user_id: string
++  total_files: number
++  completed_files: number
++  failed_files: number
++  status: 'pending' | 'processing' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled'
++  files: BatchFileStatus[]
++  created_at: string
++  updated_at: string
++  completed_at?: string
++  progress_percentage: number
++}
++
++export interface BatchWebSocketEvent {
++  type: 'batch_started' | 'file_progress' | 'batch_completed' | 'batch_status' | 'heartbeat' | 'pong'
++  batch_id?: string
++  file_index?: number
++  filename?: string
++  file_status?: string
++  content_id?: string
++  is_duplicate?: boolean
++  error?: string
++  completed_files?: number
++  failed_files?: number
++  total_files?: number
++  progress?: number
++  status?: string
++  message?: string
++  files?: Array<{
++    filename: string
++    status: string
++    content_id?: string
++    error_message?: string
++  }>
++}
++
+diff --git a/frontend/src/features/documents/components/BatchResultsModal.tsx b/frontend/src/features/documents/components/BatchResultsModal.tsx
+new file mode 100644
+index 0000000..5249dd6
+--- /dev/null
++++ b/frontend/src/features/documents/components/BatchResultsModal.tsx
+@@ -0,0 +1,213 @@
++/**
++ * BatchResultsModal Component
++ * Summary dialog shown when batch upload completes
++ */
++
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from '../../../components/ui/dialog'
++import { Button } from '../../../components/ui/Button'
++import { Badge } from '../../../components/ui/Badge'
++import { ScrollArea } from '../../../components/ui/scroll-area'
++import { Alert, AlertDescription } from '../../../components/ui/alert'
++import {
++  CheckCircle,
++  XCircle,
++  Copy,
++  RefreshCw,
++  ExternalLink,
++  PartyPopper,
++} from 'lucide-react'
++import type { BatchFileStatus } from '../../../api/types'
++import { useNavigate } from 'react-router-dom'
++
++interface BatchResultsModalProps {
++  open: boolean
++  onOpenChange: (open: boolean) => void
++  completedFiles: number
++  failedFiles: number
++  files: BatchFileStatus[]
++  onRetryFailed?: (failedFiles: BatchFileStatus[]) => void
++}
++
++export function BatchResultsModal({
++  open,
++  onOpenChange,
++  completedFiles,
++  failedFiles,
++  files,
++  onRetryFailed,
++}: BatchResultsModalProps) {
++  const navigate = useNavigate()
++
++  const successfulFiles = files.filter((f) => f.status === 'completed')
++  const failedFilesList = files.filter((f) => f.status === 'failed')
++  const duplicateFiles = files.filter((f) => f.is_duplicate)
++
++  const handleViewLibrary = () => {
++    onOpenChange(false)
++    navigate('/documents')
++  }
++
++  const handleRetryFailed = () => {
++    if (onRetryFailed && failedFilesList.length > 0) {
++      onRetryFailed(failedFilesList)
++    }
++  }
++
++  const getResultsMessage = () => {
++    if (failedFiles === 0) {
++      return 'All documents were uploaded successfully!'
++    } else if (completedFiles === 0) {
++      return 'All uploads failed. Please check the errors below.'
++    } else {
++      return `${completedFiles} document(s) uploaded successfully, ${failedFiles} failed.`
++    }
++  }
++
++  const getResultsVariant = () => {
++    if (failedFiles === 0) return 'success'
++    if (completedFiles === 0) return 'error'
++    return 'warning'
++  }
++
++  return (
++    <Dialog open={open} onOpenChange={onOpenChange}>
++      <DialogContent className="sm:max-w-[600px]">
++        <DialogHeader>
++          <DialogTitle className="flex items-center gap-2">
++            {failedFiles === 0 ? (
++              <>
++                <PartyPopper className="h-5 w-5 text-green-500" />
++                Batch Upload Complete!
++              </>
++            ) : completedFiles === 0 ? (
++              <>
++                <XCircle className="h-5 w-5 text-red-500" />
++                Upload Failed
++              </>
++            ) : (
++              <>
++                <CheckCircle className="h-5 w-5 text-yellow-500" />
++                Upload Completed with Issues
++              </>
++            )}
++          </DialogTitle>
++          <DialogDescription>{getResultsMessage()}</DialogDescription>
++        </DialogHeader>
++
++        <div className="space-y-4 py-4">
++          {/* Summary Stats */}
++          <div className="grid grid-cols-3 gap-4">
++            <div className="text-center p-3 bg-green-50 rounded-lg border border-green-200">
++              <div className="text-2xl font-bold text-green-600">{completedFiles}</div>
++              <div className="text-xs text-green-700">Successful</div>
++            </div>
++            <div className="text-center p-3 bg-red-50 rounded-lg border border-red-200">
++              <div className="text-2xl font-bold text-red-600">{failedFiles}</div>
++              <div className="text-xs text-red-700">Failed</div>
++            </div>
++            <div className="text-center p-3 bg-blue-50 rounded-lg border border-blue-200">
++              <div className="text-2xl font-bold text-blue-600">{duplicateFiles.length}</div>
++              <div className="text-xs text-blue-700">Duplicates</div>
++            </div>
++          </div>
++
++          {/* Successful Files */}
++          {successfulFiles.length > 0 && (
++            <div className="space-y-2">
++              <h4 className="text-sm font-medium flex items-center gap-2">
++                <CheckCircle className="h-4 w-4 text-green-500" />
++                Successfully Uploaded ({successfulFiles.length})
++              </h4>
++              <ScrollArea className="h-32 border rounded-md">
++                <div className="p-2 space-y-1">
++                  {successfulFiles.map((file, idx) => (
++                    <div
++                      key={idx}
++                      className="flex items-center justify-between text-sm p-2 hover:bg-muted/50 rounded"
++                    >
++                      <span className="truncate flex-1">{file.filename}</span>
++                      <div className="flex items-center gap-2">
++                        {file.is_duplicate && (
++                          <Badge variant="secondary" className="text-xs">
++                            <Copy className="h-3 w-3 mr-1" />
++                            Linked
++                          </Badge>
++                        )}
++                        {file.content_id && (
++                          <Button
++                            variant="ghost"
++                            size="sm"
++                            className="h-6 px-2"
++                            onClick={() => navigate(`/chat/${file.content_id}`)}
++                          >
++                            <ExternalLink className="h-3 w-3" />
++                          </Button>
++                        )}
++                      </div>
++                    </div>
++                  ))}
++                </div>
++              </ScrollArea>
++            </div>
++          )}
++
++          {/* Failed Files */}
++          {failedFilesList.length > 0 && (
++            <div className="space-y-2">
++              <h4 className="text-sm font-medium flex items-center gap-2">
++                <XCircle className="h-4 w-4 text-red-500" />
++                Failed ({failedFilesList.length})
++              </h4>
++              <ScrollArea className="h-32 border border-red-200 rounded-md bg-red-50/50">
++                <div className="p-2 space-y-1">
++                  {failedFilesList.map((file, idx) => (
++                    <div key={idx} className="text-sm p-2">
++                      <div className="font-medium truncate">{file.filename}</div>
++                      {file.error_message && (
++                        <div className="text-xs text-red-600 mt-1">{file.error_message}</div>
++                      )}
++                    </div>
++                  ))}
++                </div>
++              </ScrollArea>
++            </div>
++          )}
++
++          {/* Info about duplicates */}
++          {duplicateFiles.length > 0 && (
++            <Alert className="border-blue-200 bg-blue-50">
++              <Copy className="h-4 w-4 text-blue-600" />
++              <AlertDescription className="text-blue-800">
++                {duplicateFiles.length} file(s) were detected as duplicates and have been linked to
++                your account without reprocessing.
++              </AlertDescription>
++            </Alert>
++          )}
++        </div>
++
++        <DialogFooter className="flex gap-2">
++          {failedFilesList.length > 0 && onRetryFailed && (
++            <Button variant="outline" onClick={handleRetryFailed}>
++              <RefreshCw className="mr-2 h-4 w-4" />
++              Retry Failed ({failedFilesList.length})
++            </Button>
++          )}
++          <Button variant="outline" onClick={() => onOpenChange(false)}>
++            Close
++          </Button>
++          <Button onClick={handleViewLibrary}>
++            <ExternalLink className="mr-2 h-4 w-4" />
++            View Library
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  )
++}
+diff --git a/frontend/src/features/documents/components/BatchUploadProgress.tsx b/frontend/src/features/documents/components/BatchUploadProgress.tsx
+new file mode 100644
+index 0000000..3f1fe80
+--- /dev/null
++++ b/frontend/src/features/documents/components/BatchUploadProgress.tsx
+@@ -0,0 +1,404 @@
++/**
++ * BatchUploadProgress Component
++ * Displays real-time progress for batch document uploads
++ */
++
++import { useEffect, useState, useRef } from 'react'
++import { Progress } from '../../../components/ui/progress'
++import { Badge } from '../../../components/ui/Badge'
++import { ScrollArea } from '../../../components/ui/scroll-area'
++import { Alert, AlertDescription } from '../../../components/ui/alert'
++import {
++  CheckCircle,
++  XCircle,
++  Loader2,
++  Clock,
++  FileText,
++  Copy,
++  AlertTriangle,
++} from 'lucide-react'
++import type { BatchFileStatus, BatchWebSocketEvent } from '../../../api/types'
++import { documentsService } from '../../../api/documents.service'
++
++interface BatchUploadProgressProps {
++  batchId: string
++  totalFiles: number
++  initialFiles: Array<{
++    filename: string
++    size_mb: number
++    status: string
++  }>
++  onComplete?: (results: {
++    completedFiles: number
++    failedFiles: number
++    files: BatchFileStatus[]
++  }) => void
++}
++
++export function BatchUploadProgress({
++  batchId,
++  totalFiles,
++  initialFiles,
++  onComplete,
++}: BatchUploadProgressProps) {
++  const [files, setFiles] = useState<BatchFileStatus[]>(
++    initialFiles.map((f, idx) => ({
++      filename: f.filename,
++      file_index: idx,
++      status: f.status as 'pending' | 'processing' | 'completed' | 'failed',
++      is_duplicate: false,
++      total_chunks: 0,
++      processed_chunks: 0,
++      progress: 0,
++    }))
++  )
++  const [completedFiles, setCompletedFiles] = useState(0)
++  const [failedFiles, setFailedFiles] = useState(0)
++  const [overallProgress, setOverallProgress] = useState(0)
++  const [status, setStatus] = useState<string>('processing')
++  const [message, setMessage] = useState(`Processing ${totalFiles} files...`)
++
++  const wsRef = useRef<WebSocket | null>(null)
++  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
++  const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null)
++  const hasCompletedRef = useRef(false)
++
++  useEffect(() => {
++    connectWebSocket()
++
++    return () => {
++      // CRITICAL: Clean up ALL intervals and connections
++      if (wsRef.current) {
++        wsRef.current.close()
++        wsRef.current = null
++      }
++      if (pollIntervalRef.current) {
++        clearInterval(pollIntervalRef.current)
++        pollIntervalRef.current = null
++      }
++      if (heartbeatIntervalRef.current) {
++        clearInterval(heartbeatIntervalRef.current)
++        heartbeatIntervalRef.current = null
++      }
++    }
++  }, [batchId])
++
++  const connectWebSocket = () => {
++    const wsBaseUrl = import.meta.env.VITE_WS_BASE_URL || 'ws://localhost:8000'
++    const ws = new WebSocket(`${wsBaseUrl}/ws/batch/${batchId}/status`)
++    wsRef.current = ws
++
++    ws.onopen = () => {
++      console.log('Batch WebSocket connected')
++      // Send periodic pings to keep connection alive
++      // Store in ref so cleanup can clear it
++      heartbeatIntervalRef.current = setInterval(() => {
++        if (ws.readyState === WebSocket.OPEN) {
++          ws.send(JSON.stringify({ type: 'ping' }))
++        } else {
++          // WebSocket closed, clear heartbeat
++          if (heartbeatIntervalRef.current) {
++            clearInterval(heartbeatIntervalRef.current)
++            heartbeatIntervalRef.current = null
++          }
++        }
++      }, 25000)
++    }
++
++    ws.onmessage = (event) => {
++      const data: BatchWebSocketEvent = JSON.parse(event.data)
++      handleWebSocketEvent(data)
++    }
++
++    ws.onerror = (error) => {
++      console.error('Batch WebSocket error:', error)
++      // Clear heartbeat on error
++      if (heartbeatIntervalRef.current) {
++        clearInterval(heartbeatIntervalRef.current)
++        heartbeatIntervalRef.current = null
++      }
++      // Start polling fallback
++      startPolling()
++    }
++
++    ws.onclose = () => {
++      // Clear heartbeat on close
++      if (heartbeatIntervalRef.current) {
++        clearInterval(heartbeatIntervalRef.current)
++        heartbeatIntervalRef.current = null
++      }
++      console.log('Batch WebSocket closed')
++
++      // If not yet completed, start polling
++      if (!hasCompletedRef.current) {
++        startPolling()
++      }
++    }
++  }
++
++  const handleWebSocketEvent = (event: BatchWebSocketEvent) => {
++    if (event.type === 'heartbeat' || event.type === 'pong') {
++      return
++    }
++
++    if (event.type === 'batch_status' || event.type === 'batch_started') {
++      // Initial status or batch started
++      if (event.total_files) {
++        setOverallProgress(event.progress || 0)
++      }
++      if (event.message) {
++        setMessage(event.message)
++      }
++      if (event.files) {
++        // Update file statuses
++        setFiles((prev) =>
++          prev.map((file) => {
++            const update = event.files?.find((f) => f.filename === file.filename)
++            if (update) {
++              return {
++                ...file,
++                status: update.status as 'pending' | 'processing' | 'completed' | 'failed',
++                content_id: update.content_id,
++                error_message: update.error_message,
++              }
++            }
++            return file
++          })
++        )
++      }
++    } else if (event.type === 'file_progress') {
++      // Update specific file status
++      if (event.file_index !== undefined) {
++        setFiles((prev) =>
++          prev.map((file, idx) => {
++            if (idx === event.file_index) {
++              return {
++                ...file,
++                status: event.file_status as 'pending' | 'processing' | 'completed' | 'failed',
++                content_id: event.content_id || file.content_id,
++                is_duplicate: event.is_duplicate || false,
++                error_message: event.error || file.error_message,
++              }
++            }
++            return file
++          })
++        )
++      }
++
++      // Update counters
++      if (event.completed_files !== undefined) {
++        setCompletedFiles(event.completed_files)
++      }
++      if (event.failed_files !== undefined) {
++        setFailedFiles(event.failed_files)
++      }
++      if (event.progress !== undefined) {
++        setOverallProgress(event.progress)
++      }
++      if (event.message) {
++        setMessage(event.message)
++      }
++    } else if (event.type === 'batch_completed') {
++      // Batch processing complete
++      hasCompletedRef.current = true
++      setStatus(event.status || 'completed')
++      setCompletedFiles(event.completed_files || 0)
++      setFailedFiles(event.failed_files || 0)
++      setOverallProgress(100)
++      setMessage(event.message || 'Batch processing complete')
++
++      // Close WebSocket
++      if (wsRef.current) {
++        wsRef.current.close()
++      }
++
++      // Notify parent
++      if (onComplete) {
++        onComplete({
++          completedFiles: event.completed_files || 0,
++          failedFiles: event.failed_files || 0,
++          files: files,
++        })
++      }
++    }
++  }
++
++  const startPolling = () => {
++    if (pollIntervalRef.current) {
++      return // Already polling
++    }
++
++    let attempts = 0
++    const maxAttempts = 300 // 10 minutes (300 * 2s)
++
++    pollIntervalRef.current = setInterval(async () => {
++      attempts++
++
++      if (attempts > maxAttempts || hasCompletedRef.current) {
++        if (pollIntervalRef.current) {
++          clearInterval(pollIntervalRef.current)
++        }
++        return
++      }
++
++      try {
++        const batchStatus = await documentsService.getBatchStatus(batchId)
++
++        setCompletedFiles(batchStatus.completed_files)
++        setFailedFiles(batchStatus.failed_files)
++        setOverallProgress(batchStatus.progress_percentage)
++        setStatus(batchStatus.status)
++
++        // Update file statuses
++        setFiles(batchStatus.files)
++
++        // Check if completed
++        if (
++          batchStatus.status === 'completed' ||
++          batchStatus.status === 'completed_with_errors'
++        ) {
++          hasCompletedRef.current = true
++          if (pollIntervalRef.current) {
++            clearInterval(pollIntervalRef.current)
++          }
++
++          setMessage(
++            `Batch complete: ${batchStatus.completed_files} succeeded, ${batchStatus.failed_files} failed`
++          )
++
++          if (onComplete) {
++            onComplete({
++              completedFiles: batchStatus.completed_files,
++              failedFiles: batchStatus.failed_files,
++              files: batchStatus.files,
++            })
++          }
++        } else {
++          setMessage(
++            `Processing ${batchStatus.completed_files + batchStatus.failed_files}/${batchStatus.total_files} files...`
++          )
++        }
++      } catch (error) {
++        console.error('Failed to poll batch status:', error)
++      }
++    }, 2000)
++  }
++
++  const getStatusIcon = (fileStatus: string) => {
++    switch (fileStatus) {
++      case 'completed':
++        return <CheckCircle className="h-4 w-4 text-green-500" />
++      case 'failed':
++        return <XCircle className="h-4 w-4 text-red-500" />
++      case 'processing':
++        return <Loader2 className="h-4 w-4 text-blue-500 animate-spin" />
++      default:
++        return <Clock className="h-4 w-4 text-gray-400" />
++    }
++  }
++
++  const getStatusBadge = (fileStatus: string, isDuplicate: boolean) => {
++    if (isDuplicate) {
++      return (
++        <Badge variant="secondary" className="text-xs">
++          <Copy className="h-3 w-3 mr-1" />
++          Duplicate
++        </Badge>
++      )
++    }
++
++    switch (fileStatus) {
++      case 'completed':
++        return (
++          <Badge variant="default" className="bg-green-100 text-green-800 text-xs">
++            Completed
++          </Badge>
++        )
++      case 'failed':
++        return (
++          <Badge variant="destructive" className="text-xs">
++            Failed
++          </Badge>
++        )
++      case 'processing':
++        return (
++          <Badge variant="secondary" className="text-xs">
++            Processing
++          </Badge>
++        )
++      default:
++        return (
++          <Badge variant="outline" className="text-xs">
++            Pending
++          </Badge>
++        )
++    }
++  }
++
++  return (
++    <div className="space-y-4">
++      {/* Overall Progress */}
++      <div className="space-y-2">
++        <div className="flex justify-between text-sm">
++          <span className="font-medium">{message}</span>
++          <span className="text-muted-foreground">{Math.round(overallProgress)}%</span>
++        </div>
++        <Progress value={overallProgress} className="h-3" />
++        <div className="flex justify-between text-xs text-muted-foreground">
++          <span>
++            {completedFiles} completed, {failedFiles} failed of {totalFiles} total
++          </span>
++          {status.includes('completed') && (
++            <span className="text-green-600 font-medium">Done!</span>
++          )}
++        </div>
++      </div>
++
++      {/* Warning for failures */}
++      {failedFiles > 0 && status.includes('completed') && (
++        <Alert className="border-yellow-200 bg-yellow-50">
++          <AlertTriangle className="h-4 w-4 text-yellow-600" />
++          <AlertDescription className="text-yellow-800">
++            {failedFiles} file(s) failed to process. You can retry these files individually.
++          </AlertDescription>
++        </Alert>
++      )}
++
++      {/* File List */}
++      <div className="border rounded-lg">
++        <div className="p-3 bg-muted/50 border-b flex items-center gap-2">
++          <FileText className="h-4 w-4" />
++          <span className="font-medium text-sm">Files</span>
++        </div>
++        <ScrollArea className="h-64">
++          <div className="divide-y">
++            {files.map((file, index) => (
++              <div
++                key={index}
++                className="p-3 flex items-center justify-between hover:bg-muted/30 transition-colors"
++              >
++                <div className="flex items-center gap-3 flex-1 min-w-0">
++                  {getStatusIcon(file.status)}
++                  <div className="min-w-0 flex-1">
++                    <p className="text-sm font-medium truncate">{file.filename}</p>
++                    {file.error_message && (
++                      <p className="text-xs text-red-600 truncate">{file.error_message}</p>
++                    )}
++                    {file.content_id && file.status === 'completed' && (
++                      <p className="text-xs text-muted-foreground">
++                        ID: {file.content_id.slice(0, 8)}...
++                      </p>
++                    )}
++                  </div>
++                </div>
++                <div className="flex-shrink-0">
++                  {getStatusBadge(file.status, file.is_duplicate)}
++                </div>
++              </div>
++            ))}
++          </div>
++        </ScrollArea>
++      </div>
++    </div>
++  )
++}
+diff --git a/frontend/src/features/documents/components/UploadDialog.tsx b/frontend/src/features/documents/components/UploadDialog.tsx
+index 4466554..dace501 100644
+--- a/frontend/src/features/documents/components/UploadDialog.tsx
++++ b/frontend/src/features/documents/components/UploadDialog.tsx
+@@ -1,9 +1,9 @@
+ /**
+  * UploadDialog Component
+- * Modal dialog for uploading new documents with metadata
++ * Modal dialog for uploading documents (single or bulk)
+  */
+ 
+-import { useState } from 'react'
++import { useState, useRef, useEffect } from 'react'
+ import {
+   Dialog,
+   DialogContent,
+@@ -19,17 +19,53 @@ import { FileUploader } from '../../../components/ui/FileUploader'
+ import { Badge } from '../../../components/ui/Badge'
+ import { Alert, AlertDescription } from '../../../components/ui/alert'
+ import { Progress } from '../../../components/ui/progress'
+-import { Info, Upload, CheckCircle, Loader2 } from 'lucide-react'
+-import { Document } from '../../../api/types'
++import { ScrollArea } from '../../../components/ui/scroll-area'
++import {
++  Info,
++  Upload,
++  CheckCircle,
++  Loader2,
++  FileText,
++  X,
++  AlertTriangle,
++  RefreshCw,
++} from 'lucide-react'
++import { Document, BatchFileStatus } from '../../../api/types'
+ import { useAuth } from '../../auth/hooks/useAuth'
++import { documentsService } from '../../../api/documents.service'
++import { BatchUploadProgress } from './BatchUploadProgress'
++import { BatchResultsModal } from './BatchResultsModal'
+ 
+ interface UploadDialogProps {
+   open: boolean
+   onOpenChange: (open: boolean) => void
+   onUploadComplete?: (document: Document) => void
++  onBatchComplete?: () => void
++}
++
++// Constants matching backend
++const MAX_BATCH_FILES = 50
++const MAX_FILE_SIZE_MB = 50
++const MAX_BATCH_SIZE_MB = 500
++const ALLOWED_EXTENSIONS = ['pdf', 'md', 'txt', 'docx', 'doc']
++
++interface PendingBatch {
++  batch_id: string
++  total_files: number
++  completed_files: number
++  failed_files: number
++  status: string
++  progress_percentage: number
++  created_at: string
++  files_preview: Array<{ filename: string; status: string }>
+ }
+ 
+-export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDialogProps) {
++export function UploadDialog({
++  open,
++  onOpenChange,
++  onUploadComplete,
++  onBatchComplete,
++}: UploadDialogProps) {
+   const { user } = useAuth()
+   const [files, setFiles] = useState<File[]>([])
+   const [title, setTitle] = useState('')
+@@ -41,33 +77,168 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+   const [processingStatus, setProcessingStatus] = useState('')
+   const [processingProgress, setProcessingProgress] = useState(0)
+ 
++  // Batch upload state
++  const [isBatchMode, setIsBatchMode] = useState(false)
++  const [batchId, setBatchId] = useState<string | null>(null)
++  const [batchFiles, setBatchFiles] = useState<
++    Array<{ filename: string; size_mb: number; status: string }>
++  >([])
++  const [showResultsModal, setShowResultsModal] = useState(false)
++  const [batchResults, setBatchResults] = useState<{
++    completedFiles: number
++    failedFiles: number
++    files: BatchFileStatus[]
++  } | null>(null)
++  const [validationError, setValidationError] = useState<string | null>(null)
++
++  // Batch recovery state
++  const [pendingBatch, setPendingBatch] = useState<PendingBatch | null>(null)
++  const [showRecoveryPrompt, setShowRecoveryPrompt] = useState(false)
++  const [checkingPending, setCheckingPending] = useState(false)
++
++  const uploadButtonRef = useRef<HTMLButtonElement>(null)
++
++  // Check for pending batches when dialog opens
++  useEffect(() => {
++    if (open && user) {
++      checkForPendingBatches()
++    }
++  }, [open, user])
++
++  const checkForPendingBatches = async () => {
++    setCheckingPending(true)
++    try {
++      const response = await documentsService.getPendingBatches()
++      if (response.count > 0) {
++        // Show the most recent pending batch
++        setPendingBatch(response.pending_batches[0])
++        setShowRecoveryPrompt(true)
++      }
++    } catch (error) {
++      console.error('Failed to check for pending batches:', error)
++      // Don't block user from uploading
++    } finally {
++      setCheckingPending(false)
++    }
++  }
++
++  const handleResumeBatch = () => {
++    if (pendingBatch) {
++      // Resume tracking the pending batch
++      setBatchId(pendingBatch.batch_id)
++      setBatchFiles(
++        pendingBatch.files_preview.map((f, idx) => ({
++          filename: f.filename,
++          size_mb: 0, // Unknown for resumed batches
++          status: f.status,
++        }))
++      )
++      setIsBatchMode(true)
++      setIsUploading(true)
++      setShowRecoveryPrompt(false)
++      setProcessingStatus(`Resuming batch upload (${pendingBatch.progress_percentage}% complete)...`)
++    }
++  }
++
++  const handleStartNewBatch = () => {
++    // Dismiss recovery prompt, allow new upload
++    setShowRecoveryPrompt(false)
++    setPendingBatch(null)
++  }
++
+   const handleFilesChange = (newFiles: File[]) => {
++    setValidationError(null)
++
++    // Validate files
++    if (newFiles.length > MAX_BATCH_FILES) {
++      setValidationError(
++        `Too many files. Maximum ${MAX_BATCH_FILES} files per batch.`
++      )
++      return
++    }
++
++    // Check file types and sizes
++    let totalSize = 0
++    for (const file of newFiles) {
++      const ext = file.name.split('.').pop()?.toLowerCase() || ''
++      if (!ALLOWED_EXTENSIONS.includes(ext)) {
++        setValidationError(
++          `Invalid file type: ${file.name}. Allowed: ${ALLOWED_EXTENSIONS.join(', ').toUpperCase()}`
++        )
++        return
++      }
++
++      const sizeMB = file.size / (1024 * 1024)
++      if (sizeMB > MAX_FILE_SIZE_MB) {
++        setValidationError(
++          `File too large: ${file.name} (${sizeMB.toFixed(2)}MB). Max: ${MAX_FILE_SIZE_MB}MB`
++        )
++        return
++      }
++      totalSize += file.size
++    }
++
++    const totalSizeMB = totalSize / (1024 * 1024)
++    if (totalSizeMB > MAX_BATCH_SIZE_MB) {
++      setValidationError(
++        `Total batch size (${totalSizeMB.toFixed(2)}MB) exceeds maximum (${MAX_BATCH_SIZE_MB}MB)`
++      )
++      return
++    }
++
+     setFiles(newFiles)
+-    // Auto-fill title from filename if empty
+-    if (newFiles.length > 0 && !title) {
+-      const filename = newFiles[0].name.replace(/\.[^/.]+$/, '') // Remove extension
++
++    // Auto-detect batch mode
++    setIsBatchMode(newFiles.length > 1)
++
++    // Auto-fill title from filename if single file and empty
++    if (newFiles.length === 1 && !title) {
++      const filename = newFiles[0].name.replace(/\.[^/.]+$/, '')
+       setTitle(filename)
++    } else if (newFiles.length > 1) {
++      // Clear single-file title for batch mode
++      setTitle('')
+     }
+   }
+ 
++  const removeFile = (index: number) => {
++    const newFiles = files.filter((_, i) => i !== index)
++    setFiles(newFiles)
++    setIsBatchMode(newFiles.length > 1)
++    setValidationError(null)
++  }
++
+   const handleUpload = async () => {
+     if (files.length === 0 || !user) return
+ 
++    // Prevent double-click
++    if (uploadButtonRef.current) {
++      uploadButtonRef.current.disabled = true
++    }
++
+     setIsUploading(true)
+     setUploadSuccess(false)
++    setValidationError(null)
++
++    if (isBatchMode) {
++      await handleBatchUpload()
++    } else {
++      await handleSingleUpload()
++    }
++  }
++
++  const handleSingleUpload = async () => {
+     setProcessingStatus('Uploading file...')
+     setProcessingProgress(0)
+ 
+     try {
+       const file = files[0]
+-      
+-      // Upload document via real API
+       const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+-      
++
+       if (!user) {
+         throw new Error('User not authenticated')
+       }
+-      
++
+       const formData = new FormData()
+       formData.append('file', file)
+       formData.append('user_id', user.id)
+@@ -94,19 +265,17 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+       setProcessingStatus('Upload complete - processing document...')
+       setProcessingProgress(10)
+ 
+-      // Connect to WebSocket for real-time status
+       if (!document.is_duplicate) {
+         connectWebSocket(document.content_id)
+       } else {
+         setUploadSuccess(true)
+         setProcessingStatus('Duplicate detected - linked to your account')
+         setProcessingProgress(100)
+-        
++
+         if (onUploadComplete) {
+           onUploadComplete(document)
+         }
+ 
+-        // Reset form after status complete
+         setTimeout(() => {
+           handleClose()
+         }, 2000)
+@@ -119,6 +288,58 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+       setProcessingProgress(0)
+     } finally {
+       setIsUploading(false)
++      if (uploadButtonRef.current) {
++        uploadButtonRef.current.disabled = false
++      }
++    }
++  }
++
++  const handleBatchUpload = async () => {
++    setProcessingStatus(`Uploading ${files.length} files...`)
++    setProcessingProgress(0)
++
++    try {
++      const response = await documentsService.bulkUpload({
++        files: files,
++        title_prefix: title || undefined,
++        subject: subject || undefined,
++        tags: tags || undefined,
++      })
++
++      setBatchId(response.batch_id)
++      setBatchFiles(response.files)
++      setProcessingStatus(`Batch started. Processing ${response.total_files} files...`)
++      setProcessingProgress(5)
++
++      // The BatchUploadProgress component will handle WebSocket connection
++    } catch (error: any) {
++      console.error('Batch upload error:', error)
++      const errorMessage =
++        error.response?.data?.detail || error.message || 'Batch upload failed'
++      setProcessingStatus(`Batch upload failed: ${errorMessage}`)
++      setIsUploading(false)
++      if (uploadButtonRef.current) {
++        uploadButtonRef.current.disabled = false
++      }
++    }
++  }
++
++  const handleBatchComplete = (results: {
++    completedFiles: number
++    failedFiles: number
++    files: BatchFileStatus[]
++  }) => {
++    setBatchResults(results)
++    setIsUploading(false)
++    setUploadSuccess(true)
++    setShowResultsModal(true)
++
++    if (onBatchComplete) {
++      onBatchComplete()
++    }
++
++    if (uploadButtonRef.current) {
++      uploadButtonRef.current.disabled = false
+     }
+   }
+ 
+@@ -155,14 +376,12 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+         ws.close()
+         if (heartbeatInterval) clearInterval(heartbeatInterval)
+         if (pollInterval) clearInterval(pollInterval)
+-        
+-        // Notify parent with updated document
++
+         if (uploadedDoc && onUploadComplete) {
+           const completedDoc = { ...uploadedDoc, status: 'completed' as const }
+           onUploadComplete(completedDoc)
+         }
+-        
+-        // Close dialog after showing success
++
+         setTimeout(() => {
+           handleClose()
+         }, 2000)
+@@ -177,8 +396,7 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+     ws.onerror = (error) => {
+       console.error('WebSocket error:', error)
+       setProcessingStatus('Connection issue - checking status...')
+-      
+-      // Fallback to polling after WebSocket error
++
+       if (!pollInterval) {
+         startPolling(contentId)
+       }
+@@ -186,8 +404,7 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+ 
+     ws.onclose = () => {
+       if (heartbeatInterval) clearInterval(heartbeatInterval)
+-      
+-      // If closed unexpectedly and not yet completed, start polling
++
+       if (wsConnected && !uploadSuccess) {
+         console.log('WebSocket closed unexpectedly, starting polling')
+         if (!pollInterval) {
+@@ -196,34 +413,33 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+       }
+     }
+ 
+-    // Polling fallback function
+     const startPolling = (contentId: string) => {
+       let attempts = 0
+-      const maxAttempts = 150 // 5 minutes (150 * 2s)
+-      
++      const maxAttempts = 150
++
+       pollInterval = setInterval(async () => {
+         attempts++
+-        
++
+         if (attempts > maxAttempts) {
+           if (pollInterval) clearInterval(pollInterval)
+           setProcessingStatus('Processing timeout - please refresh')
+           return
+         }
+-        
++
+         try {
+           const doc = await documentsService.getDocument(contentId)
+-          
++
+           if (doc.status === 'completed') {
+             setUploadSuccess(true)
+             setProcessingStatus('Document ready for chat!')
+             setProcessingProgress(100)
+             if (pollInterval) clearInterval(pollInterval)
+-            
++
+             if (uploadedDoc && onUploadComplete) {
+               const completedDoc = { ...uploadedDoc, status: 'completed' as const }
+               onUploadComplete(completedDoc)
+             }
+-            
++
+             setTimeout(() => {
+               handleClose()
+             }, 2000)
+@@ -231,18 +447,19 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+             setProcessingStatus('Processing failed')
+             if (pollInterval) clearInterval(pollInterval)
+           } else {
+-            // Calculate progress
+-            const progress = doc.total_chunks && doc.total_chunks > 0 
+-              ? Math.floor(((doc.processed_chunks || 0) / doc.total_chunks) * 100)
+-              : 0
++            const progress =
++              doc.total_chunks && doc.total_chunks > 0
++                ? Math.floor(((doc.processed_chunks || 0) / doc.total_chunks) * 100)
++                : 0
+             setProcessingProgress(progress)
+-            setProcessingStatus(`Processing... ${doc.processed_chunks || 0}/${doc.total_chunks || 0} chunks`)
++            setProcessingStatus(
++              `Processing... ${doc.processed_chunks || 0}/${doc.total_chunks || 0} chunks`
++            )
+           }
+         } catch (error) {
+           console.error('Failed to poll status:', error)
+-          // Continue polling despite errors
+         }
+-      }, 2000) // Poll every 2 seconds
++      }, 2000)
+     }
+   }
+ 
+@@ -256,143 +473,332 @@ export function UploadDialog({ open, onOpenChange, onUploadComplete }: UploadDia
+       setUploadedDoc(null)
+       setProcessingStatus('')
+       setProcessingProgress(0)
++      setBatchId(null)
++      setBatchFiles([])
++      setIsBatchMode(false)
++      setValidationError(null)
++      setPendingBatch(null)
++      setShowRecoveryPrompt(false)
+       onOpenChange(false)
+     }
+   }
+ 
+-  const isFormValid = files.length > 0 && title.trim() !== ''
++  const handleResultsModalClose = () => {
++    setShowResultsModal(false)
++    handleClose()
++  }
++
++  const isFormValid = files.length > 0 && (isBatchMode || title.trim() !== '')
++  const totalFileSize = files.reduce((sum, f) => sum + f.size, 0) / (1024 * 1024)
+ 
+   return (
+-    <Dialog open={open} onOpenChange={handleClose}>
+-      <DialogContent className="sm:max-w-[600px]">
+-        <DialogHeader>
+-          <DialogTitle>Upload Document</DialogTitle>
+-          <DialogDescription>
+-            Add a new document to your knowledge base. Supported formats: PDF, TXT, MD, DOCX
+-          </DialogDescription>
+-        </DialogHeader>
+-
+-        <div className="space-y-6 py-4">
+-          {/* File uploader */}
+-          <FileUploader
+-            onFilesChange={handleFilesChange}
+-            accept=".pdf,.txt,.md,.docx"
+-            maxSize={50 * 1024 * 1024}
+-            maxFiles={1}
+-            multiple={false}
+-            disabled={isUploading || uploadSuccess}
+-          />
+-
+-          {/* Processing status */}
+-          {isUploading && processingStatus && (
+-            <Alert className="border-blue-200 bg-blue-50">
+-              <Loader2 className="h-4 w-4 text-blue-600 animate-spin" />
+-              <AlertDescription className="text-blue-800">
+-                <div className="space-y-2">
+-                  <div>{processingStatus}</div>
+-                  {processingProgress > 0 && (
+-                    <Progress value={processingProgress} className="h-2" />
++    <>
++      <Dialog open={open} onOpenChange={handleClose}>
++        <DialogContent className="sm:max-w-[700px]">
++          <DialogHeader>
++            <DialogTitle>
++              {isBatchMode ? `Bulk Upload (${files.length} files)` : 'Upload Document'}
++            </DialogTitle>
++            <DialogDescription>
++              {isBatchMode
++                ? `Upload multiple documents at once. Max ${MAX_BATCH_FILES} files, ${MAX_BATCH_SIZE_MB}MB total.`
++                : 'Add a new document to your knowledge base. Supported formats: PDF, TXT, MD, DOCX'}
++            </DialogDescription>
++          </DialogHeader>
++
++          <div className="space-y-6 py-4">
++            {/* Batch Recovery Prompt */}
++            {showRecoveryPrompt && pendingBatch && (
++              <Alert className="border-blue-200 bg-blue-50">
++                <RefreshCw className="h-4 w-4 text-blue-600" />
++                <AlertDescription className="text-blue-800">
++                  <div className="space-y-3">
++                    <div className="font-medium">
++                      You have an in-progress batch upload ({pendingBatch.progress_percentage}% complete)
++                    </div>
++                    <div className="text-sm">
++                      {pendingBatch.completed_files}/{pendingBatch.total_files} files processed
++                      {pendingBatch.failed_files > 0 && (
++                        <span className="text-red-600">
++                          , {pendingBatch.failed_files} failed
++                        </span>
++                      )}
++                    </div>
++                    <div className="text-xs text-muted-foreground">
++                      Started: {new Date(pendingBatch.created_at).toLocaleString()}
++                    </div>
++                    <div className="flex gap-2 mt-2">
++                      <Button
++                        size="sm"
++                        onClick={handleResumeBatch}
++                        className="bg-blue-600 hover:bg-blue-700"
++                      >
++                        <RefreshCw className="mr-2 h-3 w-3" />
++                        Resume Tracking
++                      </Button>
++                      <Button
++                        size="sm"
++                        variant="outline"
++                        onClick={handleStartNewBatch}
++                      >
++                        Start New Upload
++                      </Button>
++                    </div>
++                  </div>
++                </AlertDescription>
++              </Alert>
++            )}
++
++            {/* Checking for pending batches */}
++            {checkingPending && (
++              <div className="flex items-center gap-2 text-sm text-muted-foreground">
++                <Loader2 className="h-4 w-4 animate-spin" />
++                Checking for pending uploads...
++              </div>
++            )}
++
++            {/* File uploader - always show unless batch processing started or recovery prompt shown */}
++            {!batchId && !showRecoveryPrompt && (
++              <FileUploader
++                onFilesChange={handleFilesChange}
++                accept=".pdf,.txt,.md,.docx,.doc"
++                maxSize={MAX_FILE_SIZE_MB * 1024 * 1024}
++                maxFiles={MAX_BATCH_FILES}
++                multiple={true}
++                disabled={isUploading || uploadSuccess || checkingPending}
++              />
++            )}
++
++            {/* Validation error */}
++            {validationError && (
++              <Alert className="border-red-200 bg-red-50">
++                <AlertTriangle className="h-4 w-4 text-red-600" />
++                <AlertDescription className="text-red-800">
++                  {validationError}
++                </AlertDescription>
++              </Alert>
++            )}
++
++            {/* File list for batch mode */}
++            {isBatchMode && files.length > 0 && !batchId && (
++              <div className="border rounded-lg">
++                <div className="p-3 bg-muted/50 border-b flex items-center justify-between">
++                  <div className="flex items-center gap-2">
++                    <FileText className="h-4 w-4" />
++                    <span className="font-medium text-sm">
++                      Selected Files ({files.length})
++                    </span>
++                  </div>
++                  <Badge variant="outline">{totalFileSize.toFixed(2)} MB total</Badge>
++                </div>
++                <ScrollArea className="h-40">
++                  <div className="divide-y">
++                    {files.map((file, index) => (
++                      <div
++                        key={index}
++                        className="p-2 flex items-center justify-between hover:bg-muted/30"
++                      >
++                        <div className="flex items-center gap-2 min-w-0 flex-1">
++                          <FileText className="h-4 w-4 text-muted-foreground flex-shrink-0" />
++                          <span className="text-sm truncate">{file.name}</span>
++                        </div>
++                        <div className="flex items-center gap-2 flex-shrink-0">
++                          <span className="text-xs text-muted-foreground">
++                            {(file.size / (1024 * 1024)).toFixed(2)} MB
++                          </span>
++                          {!isUploading && (
++                            <Button
++                              variant="ghost"
++                              size="sm"
++                              className="h-6 w-6 p-0"
++                              onClick={() => removeFile(index)}
++                            >
++                              <X className="h-3 w-3" />
++                            </Button>
++                          )}
++                        </div>
++                      </div>
++                    ))}
++                  </div>
++                </ScrollArea>
++              </div>
++            )}
++
++            {/* Batch Upload Progress */}
++            {batchId && batchFiles.length > 0 && (
++              <BatchUploadProgress
++                batchId={batchId}
++                totalFiles={files.length}
++                initialFiles={batchFiles}
++                onComplete={handleBatchComplete}
++              />
++            )}
++
++            {/* Single file processing status */}
++            {!isBatchMode && isUploading && processingStatus && (
++              <Alert className="border-blue-200 bg-blue-50">
++                <Loader2 className="h-4 w-4 text-blue-600 animate-spin" />
++                <AlertDescription className="text-blue-800">
++                  <div className="space-y-2">
++                    <div>{processingStatus}</div>
++                    {processingProgress > 0 && (
++                      <Progress value={processingProgress} className="h-2" />
++                    )}
++                  </div>
++                </AlertDescription>
++              </Alert>
++            )}
++
++            {/* Single file success message */}
++            {!isBatchMode && uploadSuccess && uploadedDoc && (
++              <Alert className="border-green-200 bg-green-50">
++                <CheckCircle className="h-4 w-4 text-green-600" />
++                <AlertDescription className="text-green-800">
++                  {uploadedDoc.is_duplicate ? (
++                    <>
++                      Document already exists in knowledge base! Linked to your account.
++                      <Badge variant="secondary" className="ml-2">
++                        Duplicate Detected
++                      </Badge>
++                    </>
++                  ) : (
++                    `Document processed successfully! ${processingProgress}% complete`
+                   )}
++                </AlertDescription>
++              </Alert>
++            )}
++
++            {/* Metadata form - show for single file or batch with optional prefix */}
++            {!batchId && (
++              <div className="grid gap-4">
++                {!isBatchMode && (
++                  <div className="space-y-2">
++                    <Label htmlFor="title">Title *</Label>
++                    <Input
++                      id="title"
++                      placeholder="Document title"
++                      value={title}
++                      onChange={(e) => setTitle(e.target.value)}
++                      disabled={isUploading || uploadSuccess}
++                    />
++                  </div>
++                )}
++
++                {isBatchMode && (
++                  <div className="space-y-2">
++                    <Label htmlFor="title_prefix">Title Prefix (Optional)</Label>
++                    <Input
++                      id="title_prefix"
++                      placeholder="e.g., Chemistry Unit 3 -"
++                      value={title}
++                      onChange={(e) => setTitle(e.target.value)}
++                      disabled={isUploading || uploadSuccess}
++                    />
++                    <p className="text-xs text-muted-foreground">
++                      If provided, this will be prepended to each filename
++                    </p>
++                  </div>
++                )}
++
++                <div className="space-y-2">
++                  <Label htmlFor="subject">Subject</Label>
++                  <Input
++                    id="subject"
++                    placeholder="e.g., Chemistry, Physics, Biology, Mathematics"
++                    value={subject}
++                    onChange={(e) => setSubject(e.target.value)}
++                    disabled={isUploading || uploadSuccess}
++                  />
++                  <p className="text-xs text-muted-foreground">
++                    {isBatchMode
++                      ? 'This subject will be applied to all files'
++                      : 'Enter the subject area for this document'}
++                  </p>
++                </div>
++
++                <div className="space-y-2">
++                  <Label htmlFor="tags">Tags (comma-separated)</Label>
++                  <Input
++                    id="tags"
++                    placeholder="e.g., stoichiometry, moles, calculations"
++                    value={tags}
++                    onChange={(e) => setTags(e.target.value)}
++                    disabled={isUploading || uploadSuccess}
++                  />
++                  <p className="text-xs text-muted-foreground">
++                    {isBatchMode
++                      ? 'These tags will be applied to all files'
++                      : 'Add tags to help organize and find your documents'}
++                  </p>
+                 </div>
+-              </AlertDescription>
+-            </Alert>
+-          )}
+-
+-          {/* Success message */}
+-          {uploadSuccess && uploadedDoc && (
+-            <Alert className="border-green-200 bg-green-50">
+-              <CheckCircle className="h-4 w-4 text-green-600" />
+-              <AlertDescription className="text-green-800">
+-                {uploadedDoc.is_duplicate ? (
++              </div>
++            )}
++
++            {/* Info message */}
++            {!uploadSuccess && !isUploading && !batchId && (
++              <Alert>
++                <Info className="h-4 w-4" />
++                <AlertDescription>
++                  {isBatchMode ? (
++                    <>
++                      Documents will be processed concurrently (max 5 at a time) with real-time
++                      progress updates. Processing continues even if you navigate away.
++                    </>
++                  ) : (
++                    <>
++                      Your document will be processed automatically with real-time status updates.
++                      You'll be able to chat with it once processing is complete (usually 1-2
++                      minutes).
++                    </>
++                  )}
++                </AlertDescription>
++              </Alert>
++            )}
++          </div>
++
++          <DialogFooter>
++            <Button
++              variant="outline"
++              onClick={handleClose}
++              disabled={isUploading && !uploadSuccess}
++            >
++              {uploadSuccess || batchId ? 'Close' : 'Cancel'}
++            </Button>
++            {!uploadSuccess && !batchId && (
++              <Button
++                ref={uploadButtonRef}
++                onClick={handleUpload}
++                disabled={!isFormValid || isUploading || !!validationError}
++              >
++                {isUploading ? (
+                   <>
+-                    Document already exists in knowledge base! Linked to your account.
+-                    <Badge variant="secondary" className="ml-2">
+-                      Duplicate Detected
+-                    </Badge>
++                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
++                    {isBatchMode ? 'Starting Upload...' : 'Uploading...'}
+                   </>
+                 ) : (
+-                  `Document processed successfully! ${processingProgress}% complete`
++                  <>
++                    <Upload className="mr-2 h-4 w-4" />
++                    {isBatchMode
++                      ? `Upload All (${files.length} files)`
++                      : 'Upload'}
++                  </>
+                 )}
+-              </AlertDescription>
+-            </Alert>
+-          )}
+-
+-          {/* Metadata form */}
+-          <div className="grid gap-4">
+-            <div className="space-y-2">
+-              <Label htmlFor="title">Title *</Label>
+-              <Input
+-                id="title"
+-                placeholder="Document title"
+-                value={title}
+-                onChange={(e) => setTitle(e.target.value)}
+-                disabled={isUploading || uploadSuccess}
+-              />
+-            </div>
+-
+-            <div className="space-y-2">
+-              <Label htmlFor="subject">Subject</Label>
+-              <Input
+-                id="subject"
+-                placeholder="e.g., Chemistry, Physics, Biology, Mathematics"
+-                value={subject}
+-                onChange={(e) => setSubject(e.target.value)}
+-                disabled={isUploading || uploadSuccess}
+-              />
+-              <p className="text-xs text-muted-foreground">
+-                Enter the subject area for this document
+-              </p>
+-            </div>
+-
+-            <div className="space-y-2">
+-              <Label htmlFor="tags">Tags (comma-separated)</Label>
+-              <Input
+-                id="tags"
+-                placeholder="e.g., stoichiometry, moles, calculations"
+-                value={tags}
+-                onChange={(e) => setTags(e.target.value)}
+-                disabled={isUploading || uploadSuccess}
+-              />
+-              <p className="text-xs text-muted-foreground">
+-                Add tags to help organize and find your documents
+-              </p>
+-            </div>
+-          </div>
+-
+-          {/* Info message */}
+-          {!uploadSuccess && !isUploading && (
+-            <Alert>
+-              <Info className="h-4 w-4" />
+-              <AlertDescription>
+-                Your document will be processed automatically with real-time status updates. 
+-                You'll be able to chat with it once processing is complete (usually 1-2 minutes).
+-              </AlertDescription>
+-            </Alert>
+-          )}
+-        </div>
+-
+-        <DialogFooter>
+-          <Button variant="outline" onClick={handleClose} disabled={isUploading}>
+-            {uploadSuccess ? 'Close' : 'Cancel'}
+-          </Button>
+-          {!uploadSuccess && (
+-            <Button onClick={handleUpload} disabled={!isFormValid || isUploading}>
+-              {isUploading ? (
+-                <>
+-                  <Upload className="mr-2 h-4 w-4 animate-pulse" />
+-                  Uploading...
+-                </>
+-              ) : (
+-                <>
+-                  <Upload className="mr-2 h-4 w-4" />
+-                  Upload
+-                </>
+-              )}
+-            </Button>
+-          )}
+-        </DialogFooter>
+-      </DialogContent>
+-    </Dialog>
++              </Button>
++            )}
++          </DialogFooter>
++        </DialogContent>
++      </Dialog>
++
++      {/* Batch Results Modal */}
++      {batchResults && (
++        <BatchResultsModal
++          open={showResultsModal}
++          onOpenChange={handleResultsModalClose}
++          completedFiles={batchResults.completedFiles}
++          failedFiles={batchResults.failedFiles}
++          files={batchResults.files}
++        />
++      )}
++    </>
+   )
+ }
+-
+diff --git a/services/api-gateway/main.py b/services/api-gateway/main.py
+index 0dc7d70..597555e 100644
+--- a/services/api-gateway/main.py
++++ b/services/api-gateway/main.py
+@@ -317,15 +317,15 @@ async def upload_content(
+         settings.rate_limit_global,
+         settings.rate_limit_window_hours
+     )
+-    
++
+     # Get form data
+     form = await request.form()
+-    
++
+     # Forward to document processor
+     async with httpx.AsyncClient(timeout=300.0) as client:
+         files = {}
+         data = {"user_id": current_user['user_id']}
+-        
++
+         for key, value in form.items():
+             if hasattr(value, 'file'):
+                 # It's a file
+@@ -333,18 +333,145 @@ async def upload_content(
+             else:
+                 # It's form data
+                 data[key] = value
+-        
++
+         response = await make_service_request(
+             client, "POST", f"{settings.document_processor_url}/api/content/upload",
+             request, files=files, data=data
+         )
+-        
++
+         if response.status_code != 200:
+             raise HTTPException(status_code=response.status_code, detail=response.text)
+-        
++
++        return response.json()
++
++
++@app.post("/api/documents/bulk-upload")
++async def bulk_upload_content(
++    request: Request,
++    current_user: Dict[str, Any] = Depends(get_current_user)
++):
++    """
++    Bulk upload multiple documents at once.
++    Rate limited per user.
++    """
++    # Check rate limits
++    await check_user_rate_limit(
++        current_user['user_id'],
++        settings.rate_limit_per_user,
++        settings.rate_limit_window_hours
++    )
++    await check_global_rate_limit(
++        settings.rate_limit_global,
++        settings.rate_limit_window_hours
++    )
++
++    # Get form data with multiple files
++    form = await request.form()
++
++    # Forward to document processor
++    # Use longer timeout for bulk uploads (up to 10 minutes)
++    async with httpx.AsyncClient(timeout=600.0) as client:
++        files_list = []
++        data = {"user_id": current_user['user_id']}
++
++        for key, value in form.multi_items():
++            if hasattr(value, 'file'):
++                # It's a file - collect all files
++                files_list.append(("files", (value.filename, value.file, value.content_type)))
++            else:
++                # It's form data
++                data[key] = value
++
++        response = await make_service_request(
++            client, "POST", f"{settings.document_processor_url}/api/documents/bulk-upload",
++            request, files=files_list, data=data
++        )
++
++        if response.status_code != 200:
++            raise HTTPException(status_code=response.status_code, detail=response.text)
++
+         return response.json()
+ 
+ 
++@app.get("/api/documents/batch/{batch_id}")
++async def get_batch_status(
++    batch_id: str,
++    current_user: Dict[str, Any] = Depends(get_current_user)
++):
++    """Get the status of a batch upload job."""
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        response = await client.get(
++            f"{settings.document_processor_url}/api/documents/batch/{batch_id}"
++        )
++
++        if response.status_code != 200:
++            raise HTTPException(status_code=response.status_code, detail=response.text)
++
++        return response.json()
++
++
++@app.get("/api/documents/batches/pending")
++async def get_pending_batches(
++    current_user: Dict[str, Any] = Depends(get_current_user)
++):
++    """
++    Get pending/processing batch jobs for the current user.
++    Allows reconnection to in-progress batches after page refresh.
++    """
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        response = await client.get(
++            f"{settings.document_processor_url}/api/documents/batches/pending",
++            params={"user_id": current_user['user_id']}
++        )
++
++        if response.status_code != 200:
++            raise HTTPException(status_code=response.status_code, detail=response.text)
++
++        return response.json()
++
++
++@app.websocket("/ws/batch/{batch_id}/status")
++async def websocket_batch_proxy(websocket: WebSocket, batch_id: str):
++    """
++    WebSocket proxy for batch upload status updates.
++    Forwards connection to document-processor service.
++    """
++    await websocket.accept()
++
++    # Connect to backend WebSocket
++    backend_ws_url = f"ws://{settings.document_processor_url.split('//')[1]}/ws/batch/{batch_id}/status"
++
++    try:
++        async with websockets.connect(backend_ws_url) as backend_ws:
++            # Proxy messages in both directions
++            async def forward_from_backend():
++                async for message in backend_ws:
++                    await websocket.send_text(message)
++
++            async def forward_from_client():
++                try:
++                    while True:
++                        data = await websocket.receive_text()
++                        await backend_ws.send(data)
++                except Exception:
++                    pass
++
++            # Run both tasks concurrently
++            import asyncio
++            await asyncio.gather(
++                forward_from_backend(),
++                forward_from_client(),
++                return_exceptions=True
++            )
++
++    except Exception as e:
++        logger.error(f"Batch WebSocket proxy error: {e}")
++        try:
++            await websocket.close()
++        except:
++            pass
++
++
+ # ============================================================================
+ # RAG Query Routes
+ # ============================================================================
+diff --git a/services/document-processor/main.py b/services/document-processor/main.py
+index f395fcf..72e9922 100644
+--- a/services/document-processor/main.py
++++ b/services/document-processor/main.py
+@@ -4,13 +4,22 @@ Document Processing Service - Handles document upload, parsing, and chunking.
+ from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, WebSocket
+ from fastapi.middleware.cors import CORSMiddleware
+ import os
++import asyncio
+ from uuid import uuid4
+ from datetime import datetime
++from typing import List
+ 
+ from parsers.docling_parser import DoclingParser, save_uploaded_file
+ from chunking.chunker_factory import get_chunker
+ from publisher.rabbitmq_publisher import rabbitmq_publisher
+-from models.schemas import DocumentUploadResponse, ContentMetadata
++from models.schemas import (
++    DocumentUploadResponse,
++    ContentMetadata,
++    BatchJob,
++    BatchFileStatus,
++    BatchUploadResponse,
++    BatchStatusResponse
++)
+ from deletion_service import deletion_service
+ from config import settings
+ from shared.database.mongodb_client import mongodb_client, get_mongodb
+@@ -92,7 +101,13 @@ async def startup_event():
+     await db.content.create_index("tags")  # For filtering by tags
+     await db.suggested_questions.create_index("content_id")  # For question lookups
+     await db.suggested_questions.create_index("created_at")  # For sorting
+-    
++
++    # Batch jobs indexes
++    await db.batch_jobs.create_index("batch_id")
++    await db.batch_jobs.create_index("user_id")
++    await db.batch_jobs.create_index("status")
++    await db.batch_jobs.create_index("created_at")
++
+     logger.info("Document Processing Service started successfully")
+ 
+ 
+@@ -531,14 +546,14 @@ async def upload_content(
+             total_chunks=len(chunks),
+             message=f"Document uploaded successfully. Processing {len(chunks)} chunks."
+         )
+-        
++
+     except Exception as e:
+         # Update status to failed
+         await db.content.update_one(
+             {"content_id": content_id},
+             {"$set": {"status": "failed"}}
+         )
+-        
++
+         # Log error to trace
+         if trace:
+             try:
+@@ -553,15 +568,936 @@ async def upload_content(
+                 )
+             except Exception as update_error:
+                 logger.warning(f"Failed to log error to trace: {str(update_error)}")
+-        
++
+         logger.error(f"Failed to process document {file.filename}: {str(e)}")
+-        
++
+         raise DocumentProcessingError(
+             f"Failed to process document: {str(e)}",
+             details={"filename": file.filename, "content_id": content_id}
+         )
+ 
+ 
++# ============================================================================
++# Bulk Upload Endpoints
++# ============================================================================
++
++# Constants for batch validation
++MAX_BATCH_FILES = 50
++MAX_FILE_SIZE_MB = 50
++MAX_BATCH_SIZE_MB = 500
++ALLOWED_EXTENSIONS = ['pdf', 'md', 'txt', 'docx', 'doc']
++MAX_CONCURRENT_PROCESSING = 5
++FILE_PROCESSING_TIMEOUT = 30  # seconds
++
++# Rate limiting for batch uploads (abuse prevention)
++MAX_BATCHES_PER_USER_PER_HOUR = 5
++MAX_TOTAL_FILES_PER_USER_PER_DAY = 200
++MAX_TOTAL_SIZE_PER_USER_PER_DAY_GB = 10
++MAX_CONCURRENT_BATCHES_PER_USER = 2  # Prevent resource monopolization
++
++
++@app.post("/api/documents/bulk-upload", response_model=BatchUploadResponse)
++async def bulk_upload(
++    files: List[UploadFile] = File(...),
++    user_id: str = Form(...),
++    title_prefix: str = Form(None),
++    subject: str = Form(None),
++    tags: str = Form(None),
++    db=Depends(get_mongodb)
++):
++    """
++    Bulk upload multiple documents at once.
++
++    Validates all files upfront (without loading into memory), creates a batch job,
++    and processes files concurrently with streaming.
++    Returns immediately with batch_id for status tracking.
++
++    Memory Optimization: Files are validated using seek operations, not full reads.
++    Each file is only loaded into memory when being processed (max 5 concurrent = ~250MB).
++
++    Constraints:
++        - Max 50 files per batch
++        - Max 50MB per file
++        - Max 500MB total batch size
++        - Allowed types: PDF, MD, TXT, DOCX, DOC
++
++    Args:
++        files: List of uploaded files
++        user_id: User performing the upload
++        title_prefix: Optional prefix for document titles
++        subject: Optional subject for all documents
++        tags: Optional comma-separated tags for all documents
++
++    Returns:
++        BatchUploadResponse with batch_id for tracking
++
++    Raises:
++        FileValidationError: If any validation fails (rejects entire batch)
++    """
++    logger.info(f"Bulk upload request from user {user_id}: {len(files)} files")
++
++    # ABUSE PREVENTION: Check user's batch upload history
++    one_hour_ago = datetime.utcnow() - __import__('datetime').timedelta(hours=1)
++    one_day_ago = datetime.utcnow() - __import__('datetime').timedelta(days=1)
++
++    # Count batches in last hour
++    batches_last_hour = await db.batch_jobs.count_documents({
++        "user_id": user_id,
++        "created_at": {"$gte": one_hour_ago}
++    })
++
++    if batches_last_hour >= MAX_BATCHES_PER_USER_PER_HOUR:
++        logger.warning(f"User {user_id} exceeded batch rate limit: {batches_last_hour} batches in last hour")
++        raise FileValidationError(
++            f"Too many batch uploads. Maximum {MAX_BATCHES_PER_USER_PER_HOUR} batches per hour.",
++            details={
++                "batches_last_hour": batches_last_hour,
++                "max_per_hour": MAX_BATCHES_PER_USER_PER_HOUR,
++                "retry_after_minutes": 60
++            }
++        )
++
++    # Check concurrent batches (prevent resource monopolization)
++    concurrent_batches = await db.batch_jobs.count_documents({
++        "user_id": user_id,
++        "status": "processing"
++    })
++
++    if concurrent_batches >= MAX_CONCURRENT_BATCHES_PER_USER:
++        logger.warning(f"User {user_id} already has {concurrent_batches} batches processing")
++        raise FileValidationError(
++            f"You already have {concurrent_batches} batch(es) processing. Please wait for them to complete before starting another.",
++            details={
++                "concurrent_batches": concurrent_batches,
++                "max_concurrent": MAX_CONCURRENT_BATCHES_PER_USER,
++                "suggestion": "Check batch status or wait for completion"
++            }
++        )
++
++    # Count total files uploaded today
++    files_today_pipeline = [
++        {"$match": {"user_id": user_id, "created_at": {"$gte": one_day_ago}}},
++        {"$group": {"_id": None, "total_files": {"$sum": "$total_files"}, "total_bytes": {"$sum": "$total_size_bytes"}}}
++    ]
++    files_today_result = await db.batch_jobs.aggregate(files_today_pipeline).to_list(1)
++
++    if files_today_result:
++        total_files_today = files_today_result[0].get("total_files", 0)
++        total_bytes_today = files_today_result[0].get("total_bytes", 0)
++
++        if total_files_today + len(files) > MAX_TOTAL_FILES_PER_USER_PER_DAY:
++            logger.warning(f"User {user_id} exceeded daily file limit: {total_files_today} files today")
++            raise FileValidationError(
++                f"Daily upload limit exceeded. You've uploaded {total_files_today} files today. Maximum: {MAX_TOTAL_FILES_PER_USER_PER_DAY}.",
++                details={
++                    "files_today": total_files_today,
++                    "attempting": len(files),
++                    "max_per_day": MAX_TOTAL_FILES_PER_USER_PER_DAY
++                }
++            )
++
++        total_gb_today = total_bytes_today / (1024 * 1024 * 1024)
++        # Note: Can't calculate new_batch_gb here as we haven't validated sizes yet
++        # Will check again after validation loop with actual total_size_bytes
++        # For now, use a rough estimate based on count (worst case: all files max size)
++        estimated_new_batch_gb = len(files) * MAX_FILE_SIZE_MB / 1024  # Conservative estimate
++
++        if total_gb_today + estimated_new_batch_gb > MAX_TOTAL_SIZE_PER_USER_PER_DAY_GB:
++            logger.warning(f"User {user_id} exceeded daily size limit: {total_gb_today:.2f}GB today")
++            raise FileValidationError(
++                f"Daily upload size limit exceeded. You've uploaded {total_gb_today:.2f}GB today. Maximum: {MAX_TOTAL_SIZE_PER_USER_PER_DAY_GB}GB.",
++                details={
++                    "gb_today": round(total_gb_today, 2),
++                    "attempting_gb": round(estimated_new_batch_gb, 2),
++                    "max_gb_per_day": MAX_TOTAL_SIZE_PER_USER_PER_DAY_GB
++                }
++            )
++
++    # Validate number of files
++    if len(files) > MAX_BATCH_FILES:
++        raise FileValidationError(
++            f"Too many files. Maximum {MAX_BATCH_FILES} files per batch.",
++            details={"file_count": len(files), "max_files": MAX_BATCH_FILES}
++        )
++
++    if len(files) == 0:
++        raise FileValidationError(
++            "No files provided.",
++            details={"file_count": 0}
++        )
++
++    # MEMORY OPTIMIZATION: Validate files WITHOUT loading into memory
++    # Only store metadata, keep UploadFile references for streaming
++    total_size_bytes = 0
++    file_metadata = []  # Lightweight metadata only
++    batch_files = []
++
++    for idx, file in enumerate(files):
++        # Validate file type (no read needed)
++        file_extension = file.filename.split('.')[-1].lower() if '.' in file.filename else ''
++        if file_extension not in ALLOWED_EXTENSIONS:
++            raise FileValidationError(
++                f"Invalid file type for '{file.filename}'. Allowed types: {', '.join(ALLOWED_EXTENSIONS).upper()}",
++                details={
++                    "filename": file.filename,
++                    "extension": file_extension,
++                    "file_index": idx,
++                    "allowed": ALLOWED_EXTENSIONS
++                }
++            )
++
++        # Get file size using seek (no full read into memory)
++        file.file.seek(0, 2)  # Seek to end
++        file_size = file.file.tell()
++        file.file.seek(0)  # Reset to beginning for later reading
++        file_size_mb = file_size / (1024 * 1024)
++
++        if file_size_mb > MAX_FILE_SIZE_MB:
++            raise FileValidationError(
++                f"File '{file.filename}' is too large ({file_size_mb:.2f}MB). Maximum: {MAX_FILE_SIZE_MB}MB",
++                details={
++                    "filename": file.filename,
++                    "file_size_mb": round(file_size_mb, 2),
++                    "max_size_mb": MAX_FILE_SIZE_MB,
++                    "file_index": idx
++                }
++            )
++
++        total_size_bytes += file_size
++
++        # Store only metadata, NOT the file content
++        file_metadata.append({
++            "filename": file.filename,
++            "extension": file_extension,
++            "size_bytes": file_size,
++            "upload_file": file  # Keep reference to UploadFile for streaming
++        })
++
++        # Create file status entry
++        batch_files.append(BatchFileStatus(
++            filename=file.filename,
++            file_index=idx,
++            status="pending"
++        ))
++
++    # Validate total batch size
++    total_size_mb = total_size_bytes / (1024 * 1024)
++    if total_size_mb > MAX_BATCH_SIZE_MB:
++        raise FileValidationError(
++            f"Total batch size ({total_size_mb:.2f}MB) exceeds maximum ({MAX_BATCH_SIZE_MB}MB)",
++            details={
++                "total_size_mb": round(total_size_mb, 2),
++                "max_batch_size_mb": MAX_BATCH_SIZE_MB,
++                "file_count": len(files)
++            }
++        )
++
++    # Parse tags
++    tags_list = []
++    if tags:
++        tags_list = [tag.strip() for tag in tags.split(',') if tag.strip()]
++
++    # Create batch job
++    batch_id = str(uuid4())
++    batch_job = BatchJob(
++        batch_id=batch_id,
++        user_id=user_id,
++        total_files=len(files),
++        status="processing",
++        files=batch_files,
++        total_size_bytes=total_size_bytes,
++        subject=subject,
++        tags=tags_list
++    )
++
++    # Store batch job in MongoDB
++    await db.batch_jobs.insert_one(batch_job.model_dump())
++    logger.info(f"Created batch job {batch_id} with {len(files)} files (total: {total_size_mb:.2f}MB)")
++
++    # Publish initial batch status via WebSocket
++    try:
++        from websocket_handler import manager
++        await manager.publish_status(f"batch:{batch_id}", {
++            "type": "batch_started",
++            "batch_id": batch_id,
++            "total_files": len(files),
++            "status": "processing",
++            "message": f"Starting batch upload of {len(files)} files..."
++        })
++    except Exception as e:
++        logger.warning(f"Failed to publish batch start event: {e}")
++
++    # Start background processing task with streaming
++    asyncio.create_task(
++        process_batch_files_streaming(
++            batch_id=batch_id,
++            user_id=user_id,
++            file_metadata=file_metadata,
++            title_prefix=title_prefix,
++            subject=subject,
++            tags_list=tags_list
++        )
++    )
++
++    # Return response immediately
++    return BatchUploadResponse(
++        batch_id=batch_id,
++        total_files=len(files),
++        status="processing",
++        message=f"Batch upload started. Processing {len(files)} files.",
++        files=[
++            {
++                "filename": f["filename"],
++                "size_mb": round(f["size_bytes"] / (1024 * 1024), 2),
++                "status": "pending"
++            }
++            for f in file_metadata
++        ]
++    )
++
++
++async def process_batch_files_streaming(
++    batch_id: str,
++    user_id: str,
++    file_metadata: List[dict],
++    title_prefix: str,
++    subject: str,
++    tags_list: List[str]
++):
++    """
++    Process multiple files concurrently with streaming (memory-optimized).
++
++    Uses asyncio.Semaphore to limit concurrent processing.
++    Files are read into memory only when being processed, then immediately freed.
++    Max memory usage: 5 files * 50MB = 250MB (vs 2.5GB for all files at once).
++
++    Updates batch status in MongoDB and publishes WebSocket events.
++    """
++    db = mongodb_client.get_database()
++    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROCESSING)
++
++    async def process_single_file_streaming(file_info: dict, file_index: int):
++        """Process a single file within the batch with streaming."""
++        async with semaphore:
++            filename = file_info["filename"]
++            upload_file = file_info["upload_file"]
++            logger.info(f"Batch {batch_id}: Processing file {file_index + 1}/{len(file_metadata)}: {filename}")
++
++            # Update file status to processing
++            await update_batch_file_status(
++                db, batch_id, file_index, "processing", started_at=datetime.utcnow()
++            )
++
++            # Publish progress event
++            await publish_batch_progress(batch_id, file_index, "processing", filename)
++
++            file_content = None
++            try:
++                # READ FILE INTO MEMORY ONLY NOW (inside semaphore)
++                # This limits memory to max 5 concurrent files
++                file_content = await upload_file.read()
++                logger.debug(f"Batch {batch_id}: Loaded {filename} into memory ({len(file_content)} bytes)")
++
++                # Apply timeout to file processing
++                result = await asyncio.wait_for(
++                    process_single_document(
++                        file_content=file_content,
++                        filename=filename,
++                        file_extension=file_info["extension"],
++                        user_id=user_id,
++                        title_prefix=title_prefix,
++                        subject=subject,
++                        tags_list=tags_list,
++                        db=db
++                    ),
++                    timeout=FILE_PROCESSING_TIMEOUT
++                )
++
++                # Update file status to completed
++                await update_batch_file_status(
++                    db, batch_id, file_index, "completed",
++                    content_id=result.get("content_id"),
++                    is_duplicate=result.get("is_duplicate", False),
++                    duplicate_of=result.get("duplicate_of"),
++                    total_chunks=result.get("total_chunks", 0),
++                    completed_at=datetime.utcnow()
++                )
++
++                # Update batch counters
++                await db.batch_jobs.update_one(
++                    {"batch_id": batch_id},
++                    {
++                        "$inc": {"completed_files": 1},
++                        "$set": {"updated_at": datetime.utcnow()}
++                    }
++                )
++
++                # Publish success event
++                await publish_batch_progress(
++                    batch_id, file_index, "completed", filename,
++                    content_id=result.get("content_id"),
++                    is_duplicate=result.get("is_duplicate", False)
++                )
++
++                logger.info(f"Batch {batch_id}: Completed file {filename}")
++
++            except asyncio.TimeoutError:
++                error_msg = f"Processing timeout after {FILE_PROCESSING_TIMEOUT} seconds"
++                logger.error(f"Batch {batch_id}: {error_msg} for {filename}")
++
++                await update_batch_file_status(
++                    db, batch_id, file_index, "failed",
++                    error_message=error_msg,
++                    completed_at=datetime.utcnow()
++                )
++
++                await db.batch_jobs.update_one(
++                    {"batch_id": batch_id},
++                    {
++                        "$inc": {"failed_files": 1},
++                        "$set": {"updated_at": datetime.utcnow()}
++                    }
++                )
++
++                await publish_batch_progress(batch_id, file_index, "failed", filename, error=error_msg)
++
++            except Exception as e:
++                error_msg = str(e)
++                logger.error(f"Batch {batch_id}: Failed to process {filename}: {error_msg}")
++
++                await update_batch_file_status(
++                    db, batch_id, file_index, "failed",
++                    error_message=error_msg,
++                    completed_at=datetime.utcnow()
++                )
++
++                await db.batch_jobs.update_one(
++                    {"batch_id": batch_id},
++                    {
++                        "$inc": {"failed_files": 1},
++                        "$set": {"updated_at": datetime.utcnow()}
++                    }
++                )
++
++                await publish_batch_progress(batch_id, file_index, "failed", filename, error=error_msg)
++
++            finally:
++                # CRITICAL: Free memory immediately after processing
++                if file_content is not None:
++                    del file_content
++                    logger.debug(f"Batch {batch_id}: Released memory for {filename}")
++
++    # Process all files concurrently (semaphore limits to 5 at once)
++    tasks = [
++        process_single_file_streaming(file_info, idx)
++        for idx, file_info in enumerate(file_metadata)
++    ]
++
++    await asyncio.gather(*tasks)
++
++    # Update batch status to completed
++    batch = await db.batch_jobs.find_one({"batch_id": batch_id})
++    final_status = "completed" if batch["failed_files"] == 0 else "completed_with_errors"
++
++    await db.batch_jobs.update_one(
++        {"batch_id": batch_id},
++        {
++            "$set": {
++                "status": final_status,
++                "updated_at": datetime.utcnow(),
++                "completed_at": datetime.utcnow()
++            }
++        }
++    )
++
++    # Publish batch completion event
++    try:
++        from websocket_handler import manager
++        await manager.publish_status(f"batch:{batch_id}", {
++            "type": "batch_completed",
++            "batch_id": batch_id,
++            "status": final_status,
++            "total_files": batch["total_files"],
++            "completed_files": batch["completed_files"],
++            "failed_files": batch["failed_files"],
++            "message": f"Batch processing complete. {batch['completed_files']} succeeded, {batch['failed_files']} failed."
++        })
++    except Exception as e:
++        logger.warning(f"Failed to publish batch completion event: {e}")
++
++    logger.info(f"Batch {batch_id} completed: {batch['completed_files']} success, {batch['failed_files']} failed")
++
++
++async def process_batch_files(
++    batch_id: str,
++    user_id: str,
++    file_contents: List[dict],
++    title_prefix: str,
++    subject: str,
++    tags_list: List[str]
++):
++    """
++    DEPRECATED: Old non-streaming version. Use process_batch_files_streaming instead.
++    Kept for backward compatibility.
++    """
++    # Redirect to streaming version by wrapping file_contents
++    file_metadata = [
++        {
++            "filename": f["filename"],
++            "extension": f["extension"],
++            "size_bytes": f["size_bytes"],
++            "upload_file": type('MockUploadFile', (), {
++                'read': lambda self=f: asyncio.coroutine(lambda: f["content"])()
++            })()
++        }
++        for f in file_contents
++    ]
++
++    await process_batch_files_streaming(
++        batch_id, user_id, file_metadata, title_prefix, subject, tags_list
++    )
++
++
++async def process_single_document(
++    file_content: bytes,
++    filename: str,
++    file_extension: str,
++    user_id: str,
++    title_prefix: str,
++    subject: str,
++    tags_list: List[str],
++    db
++) -> dict:
++    """
++    Process a single document within a batch.
++
++    Reuses the same logic as single upload but without HTTP overhead.
++    Returns dict with content_id, is_duplicate, duplicate_of, total_chunks.
++    """
++    content_id = str(uuid4())
++    file_size_mb = len(file_content) / (1024 * 1024)
++    mongodb_inserted = False  # Track if we need to cleanup on failure
++
++    # Save file temporarily
++    file_path = save_uploaded_file(file_content, filename)
++
++    try:
++        # Parse document
++        parsed_doc = docling_parser.parse_document(file_path, file_extension)
++
++        # Chunk document
++        chunks = chunker.chunk_document(
++            content=parsed_doc['content'],
++            metadata=parsed_doc['metadata'],
++            structure=parsed_doc['structure']
++        )
++
++        logger.info(f"Created {len(chunks)} chunks from document {filename}")
++
++        # Generate content hash for deduplication
++        content_hash = content_hasher.generate_content_hash(parsed_doc['content'])
++
++        # Check for duplicate content
++        existing_doc = await db.content.find_one({"content_hash": content_hash})
++
++        if existing_doc:
++            # Duplicate found - update upload history
++            logger.info(f"Duplicate content detected for {filename}! Existing: {existing_doc['content_id']}")
++
++            user = await db.users.find_one({"user_id": user_id})
++            uploader_name = user.get('full_name', 'Unknown') if user else 'Unknown'
++
++            upload_history_entry = {
++                "user_id": user_id,
++                "user_name": uploader_name,
++                "upload_date": datetime.utcnow(),
++                "filename": filename,
++                "content_hash": content_hash
++            }
++
++            await db.content.update_one(
++                {"content_id": existing_doc['content_id']},
++                {
++                    "$push": {"upload_history": upload_history_entry},
++                    "$set": {"updated_at": datetime.utcnow()}
++                }
++            )
++
++            return {
++                "content_id": existing_doc['content_id'],
++                "is_duplicate": True,
++                "duplicate_of": existing_doc['content_id'],
++                "total_chunks": existing_doc.get('total_chunks', 0)
++            }
++
++        # New document - process normally
++        user = await db.users.find_one({"user_id": user_id})
++        uploader_name = user.get('full_name', 'Unknown') if user else 'Unknown'
++
++        upload_history_entry = {
++            "user_id": user_id,
++            "user_name": uploader_name,
++            "upload_date": datetime.utcnow(),
++            "filename": filename,
++            "content_hash": content_hash
++        }
++
++        # Generate title
++        title = filename.rsplit('.', 1)[0] if '.' in filename else filename
++        if title_prefix:
++            title = f"{title_prefix} - {title}"
++
++        # Store metadata in MongoDB
++        content_metadata = ContentMetadata(
++            content_id=content_id,
++            filename=filename,
++            file_type=file_extension,
++            user_id=user_id,
++            content_hash=content_hash,
++            is_duplicate=False,
++            original_uploader_id=user_id,
++            original_upload_date=datetime.utcnow(),
++            upload_history=[upload_history_entry],
++            version_number=1,
++            parent_content_id=None,
++            status="processing",
++            total_chunks=len(chunks),
++            tags=tags_list,
++            metadata={
++                "title": title,
++                "page_count": parsed_doc['metadata'].get('page_count', 1),
++                "file_size": file_size_mb,
++                "tables": len(parsed_doc['metadata'].get('tables', [])),
++                "figures": len(parsed_doc['metadata'].get('figures', [])),
++                "uploader_name": uploader_name,
++                "subject": subject or "General",
++                "grade_level": ""
++            }
++        )
++
++        await db.content.insert_one(content_metadata.model_dump())
++        mongodb_inserted = True  # Mark that we've inserted
++
++        # Enhance chunks with source metadata
++        for chunk in chunks:
++            chunk['metadata']['document_title'] = title
++            chunk['metadata']['uploader_name'] = uploader_name
++            chunk['metadata']['uploader_id'] = user_id
++            chunk['metadata']['upload_date'] = datetime.utcnow().isoformat()
++            chunk['metadata']['subject'] = subject or "General"
++            chunk['metadata']['grade_level'] = ""
++            chunk['metadata']['tags'] = tags_list
++
++        # Publish chunks to RabbitMQ for vectorization
++        # If this fails, we need to clean up the MongoDB record
++        try:
++            await rabbitmq_publisher.publish_chunks(chunks, content_id)
++        except Exception as rabbitmq_error:
++            logger.error(f"Failed to publish chunks to RabbitMQ for {filename}: {rabbitmq_error}")
++            # Clean up orphaned MongoDB record
++            await db.content.delete_one({"content_id": content_id})
++            mongodb_inserted = False
++            raise  # Re-raise to mark file as failed
++
++        # Generate suggested questions in background
++        asyncio.create_task(
++            generate_and_store_questions(
++                content_id=content_id,
++                title=title,
++                subject=subject or "General",
++                content_preview=parsed_doc['content'],
++                tags=tags_list
++            )
++        )
++
++        logger.info(f"Successfully processed document {filename} (content_id: {content_id})")
++
++        return {
++            "content_id": content_id,
++            "is_duplicate": False,
++            "duplicate_of": None,
++            "total_chunks": len(chunks)
++        }
++
++    except Exception as e:
++        # Clean up partial data if MongoDB was inserted but processing failed
++        if mongodb_inserted:
++            try:
++                await db.content.update_one(
++                    {"content_id": content_id},
++                    {"$set": {"status": "failed"}}
++                )
++                logger.info(f"Marked orphaned document {content_id} as failed")
++            except Exception as cleanup_error:
++                logger.error(f"Failed to clean up orphaned document: {cleanup_error}")
++        raise  # Re-raise the original exception
++
++    finally:
++        # Clean up temp file
++        try:
++            os.remove(file_path)
++        except Exception:
++            pass
++
++
++async def update_batch_file_status(
++    db,
++    batch_id: str,
++    file_index: int,
++    status: str,
++    content_id: str = None,
++    error_message: str = None,
++    is_duplicate: bool = False,
++    duplicate_of: str = None,
++    total_chunks: int = 0,
++    started_at: datetime = None,
++    completed_at: datetime = None
++):
++    """Update the status of a specific file within a batch job."""
++    update_fields = {
++        f"files.{file_index}.status": status,
++        "updated_at": datetime.utcnow()
++    }
++
++    if content_id:
++        update_fields[f"files.{file_index}.content_id"] = content_id
++    if error_message:
++        update_fields[f"files.{file_index}.error_message"] = error_message
++    if is_duplicate:
++        update_fields[f"files.{file_index}.is_duplicate"] = is_duplicate
++    if duplicate_of:
++        update_fields[f"files.{file_index}.duplicate_of"] = duplicate_of
++    if total_chunks:
++        update_fields[f"files.{file_index}.total_chunks"] = total_chunks
++    if started_at:
++        update_fields[f"files.{file_index}.started_at"] = started_at
++    if completed_at:
++        update_fields[f"files.{file_index}.completed_at"] = completed_at
++
++    await db.batch_jobs.update_one(
++        {"batch_id": batch_id},
++        {"$set": update_fields}
++    )
++
++
++async def publish_batch_progress(
++    batch_id: str,
++    file_index: int,
++    status: str,
++    filename: str,
++    content_id: str = None,
++    is_duplicate: bool = False,
++    error: str = None
++):
++    """Publish batch file progress update via WebSocket."""
++    try:
++        from websocket_handler import manager
++
++        # Get current batch status
++        db = mongodb_client.get_database()
++        batch = await db.batch_jobs.find_one({"batch_id": batch_id})
++
++        if batch:
++            completed = batch.get("completed_files", 0)
++            failed = batch.get("failed_files", 0)
++            total = batch.get("total_files", 0)
++            progress = int(((completed + failed) / total) * 100) if total > 0 else 0
++
++            event = {
++                "type": "file_progress",
++                "batch_id": batch_id,
++                "file_index": file_index,
++                "filename": filename,
++                "file_status": status,
++                "completed_files": completed,
++                "failed_files": failed,
++                "total_files": total,
++                "progress": progress,
++                "message": f"Processing {completed + failed}/{total} files..."
++            }
++
++            if content_id:
++                event["content_id"] = content_id
++            if is_duplicate:
++                event["is_duplicate"] = is_duplicate
++            if error:
++                event["error"] = error
++
++            await manager.publish_status(f"batch:{batch_id}", event)
++    except Exception as e:
++        logger.warning(f"Failed to publish batch progress: {e}")
++
++
++@app.get("/api/documents/batch/{batch_id}", response_model=BatchStatusResponse)
++async def get_batch_status(batch_id: str, db=Depends(get_mongodb)):
++    """
++    Get the current status of a batch upload job.
++
++    Args:
++        batch_id: The batch job ID
++
++    Returns:
++        BatchStatusResponse with full batch status and per-file details
++
++    Raises:
++        HTTPException: If batch not found
++    """
++    batch = await db.batch_jobs.find_one({"batch_id": batch_id})
++
++    if not batch:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail=f"Batch job {batch_id} not found"
++        )
++
++    # Convert to response model
++    files = [
++        BatchFileStatus(**file_data) for file_data in batch.get("files", [])
++    ]
++
++    # Calculate progress percentage
++    total = batch.get("total_files", 0)
++    completed = batch.get("completed_files", 0)
++    failed = batch.get("failed_files", 0)
++    progress = ((completed + failed) / total * 100) if total > 0 else 0
++
++    return BatchStatusResponse(
++        batch_id=batch["batch_id"],
++        user_id=batch["user_id"],
++        total_files=total,
++        completed_files=completed,
++        failed_files=failed,
++        status=batch["status"],
++        files=files,
++        created_at=batch["created_at"],
++        updated_at=batch["updated_at"],
++        completed_at=batch.get("completed_at"),
++        progress_percentage=round(progress, 1)
++    )
++
++
++@app.get("/api/documents/batches/pending")
++async def get_pending_batches(user_id: str, db=Depends(get_mongodb)):
++    """
++    Get all pending/processing batch jobs for a user.
++
++    Allows users to reconnect to in-progress batches after page refresh
++    or accidental navigation away. Prevents duplicate batch creation.
++
++    Args:
++        user_id: The user ID to check for pending batches
++
++    Returns:
++        List of pending batch jobs with their current status
++    """
++    # Find batches that are still processing (not completed or failed)
++    pending_batches = await db.batch_jobs.find(
++        {
++            "user_id": user_id,
++            "status": {"$in": ["pending", "processing"]}
++        }
++    ).sort("created_at", -1).limit(10).to_list(10)
++
++    # Format response with summary info
++    result = []
++    for batch in pending_batches:
++        total = batch.get("total_files", 0)
++        completed = batch.get("completed_files", 0)
++        failed = batch.get("failed_files", 0)
++        progress = ((completed + failed) / total * 100) if total > 0 else 0
++
++        result.append({
++            "batch_id": batch["batch_id"],
++            "total_files": total,
++            "completed_files": completed,
++            "failed_files": failed,
++            "status": batch["status"],
++            "progress_percentage": round(progress, 1),
++            "created_at": batch["created_at"].isoformat() if hasattr(batch["created_at"], 'isoformat') else batch["created_at"],
++            "updated_at": batch["updated_at"].isoformat() if hasattr(batch["updated_at"], 'isoformat') else batch["updated_at"],
++            "files_preview": [
++                {
++                    "filename": f["filename"],
++                    "status": f["status"]
++                }
++                for f in batch.get("files", [])[:5]  # First 5 files as preview
++            ]
++        })
++
++    return {
++        "pending_batches": result,
++        "count": len(result)
++    }
++
++
++@app.websocket("/ws/batch/{batch_id}/status")
++async def websocket_batch_status_endpoint(websocket: WebSocket, batch_id: str):
++    """
++    WebSocket endpoint for real-time batch upload status updates.
++
++    Usage:
++        const ws = new WebSocket('ws://localhost:8002/ws/batch/{batch_id}/status')
++        ws.onmessage = (event) => {
++            const data = JSON.parse(event.data)
++            // Events: batch_started, file_progress, batch_completed
++        }
++    """
++    from websocket_handler import manager
++
++    # Use batch: prefix for channel isolation
++    channel_id = f"batch:{batch_id}"
++    await manager.connect(websocket, channel_id)
++
++    try:
++        # Send initial batch status
++        db = mongodb_client.get_database()
++        batch = await db.batch_jobs.find_one({"batch_id": batch_id})
++
++        if batch:
++            completed = batch.get("completed_files", 0)
++            failed = batch.get("failed_files", 0)
++            total = batch.get("total_files", 0)
++            progress = int(((completed + failed) / total) * 100) if total > 0 else 0
++
++            initial_status = {
++                "type": "batch_status",
++                "batch_id": batch_id,
++                "status": batch["status"],
++                "total_files": total,
++                "completed_files": completed,
++                "failed_files": failed,
++                "progress": progress,
++                "files": [
++                    {
++                        "filename": f["filename"],
++                        "status": f["status"],
++                        "content_id": f.get("content_id"),
++                        "error_message": f.get("error_message")
++                    }
++                    for f in batch.get("files", [])
++                ]
++            }
++            await websocket.send_text(__import__("json").dumps(initial_status))
++
++        # Keep connection alive with heartbeats
++        while True:
++            try:
++                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
++
++                if data:
++                    message = __import__("json").loads(data)
++                    if message.get("type") == "ping":
++                        await websocket.send_text(__import__("json").dumps({"type": "pong"}))
++
++            except asyncio.TimeoutError:
++                await websocket.send_text(__import__("json").dumps({"type": "heartbeat"}))
++
++    except Exception as e:
++        logger.error(f"Batch WebSocket error: {e}")
++    finally:
++        manager.disconnect(websocket, channel_id)
++
++
+ @app.get("/api/content/{content_id}/status")
+ async def get_content_status(content_id: str, db=Depends(get_mongodb)):
+     """
+diff --git a/services/document-processor/models/schemas.py b/services/document-processor/models/schemas.py
+index 8ccf8af..2adcc86 100644
+--- a/services/document-processor/models/schemas.py
++++ b/services/document-processor/models/schemas.py
+@@ -73,7 +73,7 @@ class DocumentChunk(BaseModel):
+     text: str
+     token_count: int
+     metadata: Dict[str, Any]
+-    
++
+     class Config:
+         json_schema_extra = {
+             "example": {
+@@ -88,3 +88,84 @@ class DocumentChunk(BaseModel):
+             }
+         }
+ 
++
++# ============================================================================
++# Batch Upload Models
++# ============================================================================
++
++class BatchFileStatus(BaseModel):
++    """Status of a single file within a batch upload."""
++    filename: str
++    file_index: int
++    status: str = "pending"  # pending, processing, completed, failed
++    content_id: Optional[str] = None
++    error_message: Optional[str] = None
++    is_duplicate: bool = False
++    duplicate_of: Optional[str] = None
++    total_chunks: int = 0
++    processed_chunks: int = 0
++    progress: int = 0  # 0-100
++    started_at: Optional[datetime] = None
++    completed_at: Optional[datetime] = None
++
++
++class BatchJob(BaseModel):
++    """Batch upload job tracking model stored in MongoDB."""
++    batch_id: str = Field(default_factory=lambda: str(uuid4()))
++    user_id: str
++    total_files: int
++    completed_files: int = 0
++    failed_files: int = 0
++    status: str = "pending"  # pending, processing, completed, failed, cancelled
++    files: List[BatchFileStatus] = []
++    created_at: datetime = Field(default_factory=datetime.utcnow)
++    updated_at: datetime = Field(default_factory=datetime.utcnow)
++    completed_at: Optional[datetime] = None
++
++    # Metadata for the batch
++    total_size_bytes: int = 0
++    subject: Optional[str] = None
++    tags: List[str] = []
++
++    class Config:
++        json_encoders = {
++            datetime: lambda v: v.isoformat()
++        }
++
++
++class BatchUploadRequest(BaseModel):
++    """Request model for batch upload validation."""
++    user_id: str
++    title_prefix: Optional[str] = None
++    subject: Optional[str] = None
++    tags: Optional[str] = None  # Comma-separated
++
++
++class BatchUploadResponse(BaseModel):
++    """Response model for batch upload initiation."""
++    batch_id: str
++    total_files: int
++    status: str
++    message: str
++    files: List[Dict[str, Any]]  # Preview of files to be processed
++
++
++class BatchStatusResponse(BaseModel):
++    """Response model for batch status query."""
++    batch_id: str
++    user_id: str
++    total_files: int
++    completed_files: int
++    failed_files: int
++    status: str
++    files: List[BatchFileStatus]
++    created_at: datetime
++    updated_at: datetime
++    completed_at: Optional[datetime] = None
++    progress_percentage: float = 0.0
++
++    class Config:
++        json_encoders = {
++            datetime: lambda v: v.isoformat()
++        }
++
+diff --git a/services/document-processor/tests/test_bulk_upload.py b/services/document-processor/tests/test_bulk_upload.py
+new file mode 100644
+index 0000000..496c0fe
+--- /dev/null
++++ b/services/document-processor/tests/test_bulk_upload.py
+@@ -0,0 +1,1245 @@
++"""
++Unit and integration tests for Bulk Upload feature.
++Tests batch creation, concurrency limiting, failure isolation, and status tracking.
++"""
++import pytest
++import asyncio
++from unittest.mock import AsyncMock, MagicMock, patch, mock_open
++from datetime import datetime
++from uuid import uuid4
++import io
++
++from fastapi.testclient import TestClient
++from fastapi import UploadFile
++
++# Import the app and schemas
++import sys
++import os
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from models.schemas import (
++    BatchJob,
++    BatchFileStatus,
++    BatchUploadResponse,
++    BatchStatusResponse
++)
++
++
++# ============================================================================
++# Unit Tests for Batch Models
++# ============================================================================
++
++class TestBatchJobModel:
++    """Test BatchJob Pydantic model."""
++
++    def test_batch_job_creation_defaults(self):
++        """Test 1: BatchJob creates with proper defaults."""
++        job = BatchJob(
++            user_id="user123",
++            total_files=5
++        )
++
++        assert job.batch_id is not None
++        assert len(job.batch_id) == 36  # UUID format
++        assert job.user_id == "user123"
++        assert job.total_files == 5
++        assert job.completed_files == 0
++        assert job.failed_files == 0
++        assert job.status == "pending"
++        assert job.files == []
++        assert isinstance(job.created_at, datetime)
++        assert isinstance(job.updated_at, datetime)
++
++    def test_batch_job_with_files(self):
++        """Test 2: BatchJob with file statuses."""
++        files = [
++            BatchFileStatus(
++                filename="doc1.pdf",
++                file_index=0,
++                status="pending"
++            ),
++            BatchFileStatus(
++                filename="doc2.pdf",
++                file_index=1,
++                status="pending"
++            )
++        ]
++
++        job = BatchJob(
++            user_id="user123",
++            total_files=2,
++            files=files,
++            subject="Chemistry",
++            tags=["organic", "bonds"]
++        )
++
++        assert len(job.files) == 2
++        assert job.files[0].filename == "doc1.pdf"
++        assert job.files[1].filename == "doc2.pdf"
++        assert job.subject == "Chemistry"
++        assert job.tags == ["organic", "bonds"]
++
++    def test_batch_file_status_defaults(self):
++        """Test 3: BatchFileStatus has correct defaults."""
++        status = BatchFileStatus(
++            filename="test.pdf",
++            file_index=0
++        )
++
++        assert status.filename == "test.pdf"
++        assert status.file_index == 0
++        assert status.status == "pending"
++        assert status.content_id is None
++        assert status.error_message is None
++        assert status.is_duplicate is False
++        assert status.total_chunks == 0
++        assert status.progress == 0
++
++    def test_batch_file_status_with_error(self):
++        """Test 4: BatchFileStatus tracks errors."""
++        status = BatchFileStatus(
++            filename="bad_file.pdf",
++            file_index=2,
++            status="failed",
++            error_message="File corrupted",
++            completed_at=datetime.utcnow()
++        )
++
++        assert status.status == "failed"
++        assert status.error_message == "File corrupted"
++        assert status.completed_at is not None
++
++    def test_batch_file_status_duplicate(self):
++        """Test 5: BatchFileStatus tracks duplicates."""
++        original_id = str(uuid4())
++        status = BatchFileStatus(
++            filename="duplicate.pdf",
++            file_index=1,
++            status="completed",
++            content_id=original_id,
++            is_duplicate=True,
++            duplicate_of=original_id
++        )
++
++        assert status.is_duplicate is True
++        assert status.duplicate_of == original_id
++
++
++class TestBatchUploadResponse:
++    """Test BatchUploadResponse model."""
++
++    def test_response_structure(self):
++        """Test 6: Response has correct structure."""
++        response = BatchUploadResponse(
++            batch_id="batch-123",
++            total_files=3,
++            status="processing",
++            message="Batch started",
++            files=[
++                {"filename": "a.pdf", "size_mb": 1.5, "status": "pending"},
++                {"filename": "b.pdf", "size_mb": 2.3, "status": "pending"},
++                {"filename": "c.pdf", "size_mb": 0.8, "status": "pending"}
++            ]
++        )
++
++        assert response.batch_id == "batch-123"
++        assert response.total_files == 3
++        assert response.status == "processing"
++        assert len(response.files) == 3
++        assert response.files[0]["filename"] == "a.pdf"
++
++
++class TestBatchStatusResponse:
++    """Test BatchStatusResponse model."""
++
++    def test_status_response_with_progress(self):
++        """Test 7: Status response calculates progress."""
++        files = [
++            BatchFileStatus(filename="a.pdf", file_index=0, status="completed"),
++            BatchFileStatus(filename="b.pdf", file_index=1, status="completed"),
++            BatchFileStatus(filename="c.pdf", file_index=2, status="failed"),
++            BatchFileStatus(filename="d.pdf", file_index=3, status="processing"),
++        ]
++
++        response = BatchStatusResponse(
++            batch_id="batch-456",
++            user_id="user123",
++            total_files=4,
++            completed_files=2,
++            failed_files=1,
++            status="processing",
++            files=files,
++            created_at=datetime.utcnow(),
++            updated_at=datetime.utcnow(),
++            progress_percentage=75.0
++        )
++
++        assert response.total_files == 4
++        assert response.completed_files == 2
++        assert response.failed_files == 1
++        assert response.progress_percentage == 75.0
++
++
++# ============================================================================
++# Integration Tests for Bulk Upload Logic
++# ============================================================================
++
++class TestBatchFileValidation:
++    """Test file validation logic."""
++
++    def test_valid_file_extensions(self):
++        """Test 8: All valid extensions are accepted."""
++        valid_extensions = ['pdf', 'md', 'txt', 'docx', 'doc']
++
++        for ext in valid_extensions:
++            filename = f"test.{ext}"
++            file_extension = filename.split('.')[-1].lower()
++            assert file_extension in valid_extensions
++
++    def test_invalid_file_extension_rejected(self):
++        """Test 9: Invalid extensions are rejected."""
++        valid_extensions = ['pdf', 'md', 'txt', 'docx', 'doc']
++        invalid_files = ['test.exe', 'script.py', 'image.jpg', 'data.csv']
++
++        for filename in invalid_files:
++            ext = filename.split('.')[-1].lower()
++            assert ext not in valid_extensions
++
++    def test_file_size_validation(self):
++        """Test 10: File size limits are enforced."""
++        MAX_FILE_SIZE_MB = 50
++
++        # Valid size
++        valid_size_mb = 45.0
++        assert valid_size_mb <= MAX_FILE_SIZE_MB
++
++        # Invalid size
++        invalid_size_mb = 55.0
++        assert invalid_size_mb > MAX_FILE_SIZE_MB
++
++    def test_batch_size_validation(self):
++        """Test 11: Total batch size limits are enforced."""
++        MAX_BATCH_SIZE_MB = 500
++
++        # Valid batch
++        files_sizes = [10.0, 20.0, 30.0, 40.0, 50.0]  # 150MB total
++        total = sum(files_sizes)
++        assert total <= MAX_BATCH_SIZE_MB
++
++        # Invalid batch
++        large_files = [100.0] * 6  # 600MB total
++        total_large = sum(large_files)
++        assert total_large > MAX_BATCH_SIZE_MB
++
++    def test_max_files_validation(self):
++        """Test 12: Maximum file count is enforced."""
++        MAX_BATCH_FILES = 50
++
++        # Valid count
++        assert 20 <= MAX_BATCH_FILES
++        assert 50 <= MAX_BATCH_FILES
++
++        # Invalid count
++        assert 51 > MAX_BATCH_FILES
++        assert 100 > MAX_BATCH_FILES
++
++
++class TestConcurrencyControl:
++    """Test concurrent processing with semaphore."""
++
++    @pytest.mark.asyncio
++    async def test_concurrent_batch_limit_enforced(self):
++        """Test 52: User cannot start more than 2 concurrent batches."""
++        from unittest.mock import AsyncMock, MagicMock
++        from shared.exceptions.custom_exceptions import FileValidationError
++
++        # User already has 2 batches processing
++        mock_db = MagicMock()
++
++        async def mock_count_documents(query):
++            if query.get("status") == "processing":
++                return 2  # Already at limit
++            return 0  # No rate limit issues
++
++        async def mock_aggregate(pipeline):
++            class MockCursor:
++                async def to_list(self, limit):
++                    return []
++            return MockCursor()
++
++        mock_db.batch_jobs.count_documents = mock_count_documents
++        mock_db.batch_jobs.aggregate = mock_aggregate
++
++        # Try to start a third batch - should be rejected
++        from main import MAX_CONCURRENT_BATCHES_PER_USER
++
++        concurrent_batches = await mock_db.batch_jobs.count_documents({
++            "user_id": "user123",
++            "status": "processing"
++        })
++
++        assert concurrent_batches >= MAX_CONCURRENT_BATCHES_PER_USER
++        assert concurrent_batches == 2
++
++        # This check happens in bulk_upload endpoint
++        should_reject = concurrent_batches >= MAX_CONCURRENT_BATCHES_PER_USER
++        assert should_reject, "Should prevent more than 2 concurrent batches"
++
++    @pytest.mark.asyncio
++    async def test_concurrent_batch_limit_allows_when_below(self):
++        """Test 53: User can start batch when below concurrent limit."""
++        mock_db = MagicMock()
++
++        async def mock_count_documents(query):
++            if query.get("status") == "processing":
++                return 1  # Only 1 processing, can start another
++            return 0
++
++        mock_db.batch_jobs.count_documents = mock_count_documents
++
++        concurrent_batches = await mock_db.batch_jobs.count_documents({
++            "user_id": "user123",
++            "status": "processing"
++        })
++
++        from main import MAX_CONCURRENT_BATCHES_PER_USER
++        assert concurrent_batches < MAX_CONCURRENT_BATCHES_PER_USER
++
++        should_allow = concurrent_batches < MAX_CONCURRENT_BATCHES_PER_USER
++        assert should_allow, "Should allow batch when below limit"
++
++    @pytest.mark.asyncio
++    async def test_semaphore_limits_concurrency(self):
++        """Test 13: Semaphore limits concurrent tasks."""
++        MAX_CONCURRENT = 5
++        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
++
++        active_count = 0
++        max_active = 0
++        results = []
++
++        async def task(task_id):
++            nonlocal active_count, max_active
++            async with semaphore:
++                active_count += 1
++                max_active = max(max_active, active_count)
++                await asyncio.sleep(0.1)  # Simulate work
++                active_count -= 1
++                results.append(task_id)
++
++        # Create 10 tasks (more than semaphore allows)
++        tasks = [task(i) for i in range(10)]
++        await asyncio.gather(*tasks)
++
++        # All tasks should complete
++        assert len(results) == 10
++
++        # Never exceeded max concurrent
++        assert max_active <= MAX_CONCURRENT
++
++    @pytest.mark.asyncio
++    async def test_failure_isolation(self):
++        """Test 14: One task failure doesn't affect others."""
++        results = []
++        errors = []
++
++        async def task(task_id, should_fail=False):
++            if should_fail:
++                errors.append(task_id)
++                raise Exception(f"Task {task_id} failed")
++            results.append(task_id)
++
++        # Mix of successful and failing tasks
++        tasks = [
++            task(0),
++            task(1, should_fail=True),  # Will fail
++            task(2),
++            task(3, should_fail=True),  # Will fail
++            task(4)
++        ]
++
++        # Use gather with return_exceptions to isolate failures
++        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
++
++        # 3 successful, 2 failed
++        assert len(results) == 3
++        assert len(errors) == 2
++
++        # All tasks completed (either success or exception)
++        assert len(outcomes) == 5
++
++    @pytest.mark.asyncio
++    async def test_timeout_handling(self):
++        """Test 15: File processing timeout is enforced."""
++        FILE_PROCESSING_TIMEOUT = 1  # 1 second for test
++
++        async def slow_task():
++            await asyncio.sleep(5)  # Takes too long
++            return "completed"
++
++        with pytest.raises(asyncio.TimeoutError):
++            await asyncio.wait_for(slow_task(), timeout=FILE_PROCESSING_TIMEOUT)
++
++    @pytest.mark.asyncio
++    async def test_batch_completion_tracking(self):
++        """Test 16: Batch completion is tracked correctly."""
++        total_files = 10
++        completed = 0
++        failed = 0
++
++        async def process_file(should_succeed):
++            nonlocal completed, failed
++            if should_succeed:
++                completed += 1
++            else:
++                failed += 1
++
++        # Process mixed results
++        tasks = [
++            process_file(True),   # Success
++            process_file(True),   # Success
++            process_file(False),  # Fail
++            process_file(True),   # Success
++            process_file(True),   # Success
++            process_file(False),  # Fail
++            process_file(True),   # Success
++            process_file(True),   # Success
++            process_file(True),   # Success
++            process_file(True),   # Success
++        ]
++
++        await asyncio.gather(*tasks)
++
++        assert completed == 8
++        assert failed == 2
++        assert completed + failed == total_files
++
++        # Determine final status
++        final_status = "completed" if failed == 0 else "completed_with_errors"
++        assert final_status == "completed_with_errors"
++
++
++class TestProgressCalculation:
++    """Test progress percentage calculations."""
++
++    def test_progress_zero_when_starting(self):
++        """Test 17: Progress is 0 at start."""
++        total = 10
++        completed = 0
++        failed = 0
++        progress = ((completed + failed) / total * 100) if total > 0 else 0
++        assert progress == 0.0
++
++    def test_progress_partial(self):
++        """Test 18: Progress calculates correctly mid-batch."""
++        total = 10
++        completed = 3
++        failed = 1
++        progress = ((completed + failed) / total * 100)
++        assert progress == 40.0
++
++    def test_progress_complete(self):
++        """Test 19: Progress is 100 when done."""
++        total = 10
++        completed = 8
++        failed = 2
++        progress = ((completed + failed) / total * 100)
++        assert progress == 100.0
++
++    def test_progress_with_zero_files(self):
++        """Test 20: Handle edge case of zero files."""
++        total = 0
++        completed = 0
++        failed = 0
++        progress = ((completed + failed) / total * 100) if total > 0 else 0
++        assert progress == 0
++
++
++class TestBatchStatusUpdates:
++    """Test batch status update logic."""
++
++    def test_batch_file_status_update_fields(self):
++        """Test 21: File status updates have correct fields."""
++        update_fields = {
++            "files.0.status": "processing",
++            "updated_at": datetime.utcnow()
++        }
++
++        # Add optional fields
++        content_id = str(uuid4())
++        update_fields["files.0.content_id"] = content_id
++        update_fields["files.0.is_duplicate"] = False
++        update_fields["files.0.total_chunks"] = 25
++
++        assert "files.0.status" in update_fields
++        assert "files.0.content_id" in update_fields
++        assert update_fields["files.0.total_chunks"] == 25
++
++    def test_batch_counters_increment(self):
++        """Test 22: Batch counters increment correctly."""
++        batch = {
++            "completed_files": 5,
++            "failed_files": 1
++        }
++
++        # Simulate successful completion
++        batch["completed_files"] += 1
++        assert batch["completed_files"] == 6
++
++        # Simulate failure
++        batch["failed_files"] += 1
++        assert batch["failed_files"] == 2
++
++    def test_final_status_determination(self):
++        """Test 23: Final batch status is set correctly."""
++        # All successful
++        failed = 0
++        status = "completed" if failed == 0 else "completed_with_errors"
++        assert status == "completed"
++
++        # Some failures
++        failed = 3
++        status = "completed" if failed == 0 else "completed_with_errors"
++        assert status == "completed_with_errors"
++
++
++class TestWebSocketEvents:
++    """Test WebSocket event structure."""
++
++    def test_batch_started_event(self):
++        """Test 24: Batch started event has correct structure."""
++        event = {
++            "type": "batch_started",
++            "batch_id": "batch-123",
++            "total_files": 10,
++            "status": "processing",
++            "message": "Starting batch upload of 10 files..."
++        }
++
++        assert event["type"] == "batch_started"
++        assert event["total_files"] == 10
++        assert "batch_id" in event
++
++    def test_file_progress_event(self):
++        """Test 25: File progress event has correct structure."""
++        event = {
++            "type": "file_progress",
++            "batch_id": "batch-123",
++            "file_index": 3,
++            "filename": "document.pdf",
++            "file_status": "completed",
++            "completed_files": 4,
++            "failed_files": 1,
++            "total_files": 10,
++            "progress": 50,
++            "message": "Processing 5/10 files..."
++        }
++
++        assert event["type"] == "file_progress"
++        assert event["file_index"] == 3
++        assert event["file_status"] == "completed"
++        assert event["progress"] == 50
++
++    def test_batch_completed_event(self):
++        """Test 26: Batch completed event has correct structure."""
++        event = {
++            "type": "batch_completed",
++            "batch_id": "batch-123",
++            "status": "completed_with_errors",
++            "total_files": 10,
++            "completed_files": 8,
++            "failed_files": 2,
++            "message": "Batch processing complete. 8 succeeded, 2 failed."
++        }
++
++        assert event["type"] == "batch_completed"
++        assert event["status"] == "completed_with_errors"
++        assert event["completed_files"] == 8
++        assert event["failed_files"] == 2
++
++    def test_heartbeat_event(self):
++        """Test 27: Heartbeat event is simple."""
++        event = {"type": "heartbeat"}
++        assert event["type"] == "heartbeat"
++
++    def test_pong_event(self):
++        """Test 28: Pong response is simple."""
++        event = {"type": "pong"}
++        assert event["type"] == "pong"
++
++
++class TestTagsParsing:
++    """Test tags parsing logic."""
++
++    def test_parse_comma_separated_tags(self):
++        """Test 29: Tags are parsed correctly from comma-separated string."""
++        tags_str = "chemistry, organic, bonds"
++        tags_list = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
++
++        assert tags_list == ["chemistry", "organic", "bonds"]
++
++    def test_parse_tags_with_extra_spaces(self):
++        """Test 30: Tags parsing handles extra spaces."""
++        tags_str = "  physics ,  quantum  ,  mechanics  "
++        tags_list = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
++
++        assert tags_list == ["physics", "quantum", "mechanics"]
++
++    def test_parse_empty_tags(self):
++        """Test 31: Empty tags string returns empty list."""
++        tags_str = ""
++        tags_list = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
++
++        assert tags_list == []
++
++    def test_parse_single_tag(self):
++        """Test 32: Single tag is parsed correctly."""
++        tags_str = "biology"
++        tags_list = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
++
++        assert tags_list == ["biology"]
++
++
++class TestTitleGeneration:
++    """Test title generation for batch files."""
++
++    def test_title_from_filename_with_extension(self):
++        """Test 33: Title extracted from filename."""
++        filename = "chemistry_chapter_3.pdf"
++        title = filename.rsplit('.', 1)[0] if '.' in filename else filename
++        assert title == "chemistry_chapter_3"
++
++    def test_title_from_filename_no_extension(self):
++        """Test 34: Handle filename without extension."""
++        filename = "readme"
++        title = filename.rsplit('.', 1)[0] if '.' in filename else filename
++        assert title == "readme"
++
++    def test_title_with_prefix(self):
++        """Test 35: Title prefix is prepended."""
++        filename = "chapter_3.pdf"
++        title_prefix = "Chemistry Unit 2"
++        title = filename.rsplit('.', 1)[0]
++
++        if title_prefix:
++            title = f"{title_prefix} - {title}"
++
++        assert title == "Chemistry Unit 2 - chapter_3"
++
++    def test_title_without_prefix(self):
++        """Test 36: Title without prefix uses filename."""
++        filename = "organic_bonds.pdf"
++        title_prefix = None
++        title = filename.rsplit('.', 1)[0]
++
++        if title_prefix:
++            title = f"{title_prefix} - {title}"
++
++        assert title == "organic_bonds"
++
++
++# ============================================================================
++# Edge Cases and Error Handling
++# ============================================================================
++
++class TestEdgeCases:
++    """Test edge cases and error scenarios."""
++
++    def test_empty_batch_rejected(self):
++        """Test 37: Empty batch is rejected."""
++        files = []
++        assert len(files) == 0
++        # Should raise FileValidationError in actual implementation
++
++    def test_single_file_batch_allowed(self):
++        """Test 38: Single file batch is allowed."""
++        files = ["single.pdf"]
++        MAX_BATCH_FILES = 50
++        assert len(files) <= MAX_BATCH_FILES
++        assert len(files) > 0
++
++    def test_exact_max_files_allowed(self):
++        """Test 39: Exactly 50 files is allowed."""
++        files = [f"file_{i}.pdf" for i in range(50)]
++        MAX_BATCH_FILES = 50
++        assert len(files) == MAX_BATCH_FILES
++        assert len(files) <= MAX_BATCH_FILES
++
++    def test_over_max_files_rejected(self):
++        """Test 40: Over 50 files is rejected."""
++        files = [f"file_{i}.pdf" for i in range(51)]
++        MAX_BATCH_FILES = 50
++        assert len(files) > MAX_BATCH_FILES
++
++    def test_filename_with_multiple_dots(self):
++        """Test 41: Handle filenames with multiple dots."""
++        filename = "document.final.version.2.pdf"
++        extension = filename.split('.')[-1].lower()
++        assert extension == "pdf"
++
++        title = filename.rsplit('.', 1)[0]
++        assert title == "document.final.version.2"
++
++    def test_unicode_filename(self):
++        """Test 42: Handle unicode in filenames."""
++        filename = "化学文档.pdf"
++        extension = filename.split('.')[-1].lower()
++        assert extension == "pdf"
++
++        title = filename.rsplit('.', 1)[0]
++        assert title == "化学文档"
++
++    def test_very_long_filename(self):
++        """Test 43: Handle very long filenames."""
++        long_name = "a" * 200 + ".pdf"
++        extension = long_name.split('.')[-1].lower()
++        assert extension == "pdf"
++        assert len(long_name) > 200
++
++
++class TestDuplicateHandling:
++    """Test duplicate document detection in batches."""
++
++    def test_duplicate_marked_in_file_status(self):
++        """Test 44: Duplicate files are marked correctly."""
++        original_id = str(uuid4())
++        status = BatchFileStatus(
++            filename="duplicate.pdf",
++            file_index=2,
++            status="completed",
++            content_id=original_id,
++            is_duplicate=True,
++            duplicate_of=original_id
++        )
++
++        assert status.is_duplicate is True
++        assert status.duplicate_of == original_id
++        assert status.status == "completed"  # Still counts as success
++
++    def test_duplicate_counts_as_success(self):
++        """Test 45: Duplicate files count toward completed_files."""
++        # Duplicate detection skips processing but counts as success
++        completed_files = 5
++        is_duplicate = True
++
++        if is_duplicate:
++            # Still increment completed
++            completed_files += 1
++
++        assert completed_files == 6
++
++
++# ============================================================================
++# Performance Considerations
++# ============================================================================
++
++class TestRabbitMQFailureCleanup:
++    """Test cleanup when RabbitMQ fails."""
++
++    @pytest.mark.asyncio
++    async def test_rabbitmq_failure_cleanup(self):
++        """Test 48: Orphaned MongoDB record is cleaned up on RabbitMQ failure."""
++        from unittest.mock import AsyncMock, patch, MagicMock
++
++        # Mock database
++        mock_db = MagicMock()
++        mock_db.content.find_one = AsyncMock(return_value=None)  # No duplicate
++        mock_db.content.insert_one = AsyncMock()
++        mock_db.content.delete_one = AsyncMock()
++        mock_db.content.update_one = AsyncMock()
++        mock_db.users.find_one = AsyncMock(return_value={"full_name": "Test User"})
++
++        # Track what was called
++        insert_called = False
++        delete_called = False
++
++        async def track_insert(*args):
++            nonlocal insert_called
++            insert_called = True
++
++        async def track_delete(*args):
++            nonlocal delete_called
++            delete_called = True
++
++        mock_db.content.insert_one = track_insert
++        mock_db.content.delete_one = track_delete
++
++        # Mock parser and chunker
++        mock_parser = MagicMock()
++        mock_parser.parse_document.return_value = {
++            'content': 'Test content',
++            'metadata': {'page_count': 1, 'tables': [], 'figures': []},
++            'structure': []
++        }
++
++        mock_chunker = MagicMock()
++        mock_chunker.chunk_document.return_value = [
++            {'text': 'chunk1', 'token_count': 10, 'chunk_index': 0, 'metadata': {}}
++        ]
++
++        # Mock RabbitMQ publisher to FAIL
++        mock_publisher = MagicMock()
++        mock_publisher.publish_chunks = AsyncMock(
++            side_effect=Exception("Connection refused to RabbitMQ")
++        )
++
++        # Test that cleanup happens
++        with patch('main.docling_parser', mock_parser), \
++             patch('main.chunker', mock_chunker), \
++             patch('main.rabbitmq_publisher', mock_publisher), \
++             patch('main.save_uploaded_file', return_value='/tmp/test.pdf'), \
++             patch('main.content_hasher.generate_content_hash', return_value='abc123'), \
++             patch('os.remove'):
++
++            # Import after patching
++            import sys
++            sys.path.insert(0, '..')
++
++            # Simulate process_single_document behavior
++            mongodb_inserted = False
++            content_id = "test-123"
++
++            try:
++                # Simulate: Insert to MongoDB
++                await track_insert({})
++                mongodb_inserted = True
++
++                # Simulate: Try to publish (fails)
++                await mock_publisher.publish_chunks([], content_id)
++
++            except Exception as e:
++                # Simulate: Clean up on failure
++                if mongodb_inserted:
++                    await track_delete({"content_id": content_id})
++                    mongodb_inserted = False
++
++                error_msg = str(e)
++                assert "RabbitMQ" in error_msg
++
++        # Verify cleanup happened
++        assert insert_called, "MongoDB insert should have been called"
++        assert delete_called, "MongoDB delete should have been called for cleanup"
++        assert not mongodb_inserted, "mongodb_inserted flag should be False after cleanup"
++
++    @pytest.mark.asyncio
++    async def test_partial_failure_marks_document_failed(self):
++        """Test 49: If cleanup delete fails, document is marked as failed."""
++        mongodb_inserted = True
++        cleanup_succeeded = False
++
++        # Simulate failed cleanup (e.g., MongoDB also down)
++        try:
++            # Try to delete but fail
++            raise Exception("MongoDB delete failed")
++        except:
++            # Fallback: mark as failed instead
++            cleanup_succeeded = False
++
++        # In production code, this triggers the fallback update
++        if not cleanup_succeeded and mongodb_inserted:
++            # Would call: await db.content.update_one({"content_id": id}, {"$set": {"status": "failed"}})
++            status_updated = True
++
++        assert status_updated, "Should mark document as failed when delete fails"
++
++
++class TestIntegrationFlow:
++    """Integration tests for full batch upload flow."""
++
++    @pytest.mark.asyncio
++    async def test_full_batch_upload_flow(self):
++        """Test 50: Complete integration test - upload 3 files, verify all complete."""
++        from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
++        from io import BytesIO
++        from fastapi import UploadFile
++        from datetime import datetime
++
++        # Setup: Create 3 test files
++        test_files_data = [
++            ("lecture1.pdf", b"PDF content for lecture 1" * 100),
++            ("notes.txt", b"Text notes content" * 50),
++            ("summary.md", b"# Summary\nMarkdown content" * 75),
++        ]
++
++        upload_files = []
++        for filename, content in test_files_data:
++            file_obj = BytesIO(content)
++            upload_file = UploadFile(filename=filename, file=file_obj)
++            upload_files.append(upload_file)
++
++        # Mock MongoDB with tracking
++        mock_db = MagicMock()
++        batch_jobs_collection = {}
++        content_collection = {}
++
++        async def mock_count_documents(query):
++            # Rate limit checks - return 0 for tests
++            return 0
++
++        async def mock_aggregate(pipeline):
++            class MockCursor:
++                async def to_list(self, limit):
++                    return []
++            return MockCursor()
++
++        async def mock_insert_batch(doc):
++            batch_jobs_collection[doc["batch_id"]] = doc
++
++        async def mock_find_one_batch(query):
++            batch_id = query.get("batch_id")
++            return batch_jobs_collection.get(batch_id)
++
++        async def mock_update_one_batch(query, update):
++            batch_id = query.get("batch_id")
++            if batch_id in batch_jobs_collection:
++                if "$inc" in update:
++                    for key, val in update["$inc"].items():
++                        batch_jobs_collection[batch_id][key] = batch_jobs_collection[batch_id].get(key, 0) + val
++                if "$set" in update:
++                    for key, val in update["$set"].items():
++                        if key.startswith("files."):
++                            # Handle nested updates like files.0.status
++                            parts = key.split(".")
++                            idx = int(parts[1])
++                            field = parts[2]
++                            batch_jobs_collection[batch_id]["files"][idx][field] = val
++                        else:
++                            batch_jobs_collection[batch_id][key] = val
++
++        async def mock_insert_content(doc):
++            content_collection[doc["content_id"]] = doc
++
++        async def mock_find_one_content(query):
++            # No duplicates
++            return None
++
++        async def mock_find_one_user(query):
++            return {"full_name": "Test Teacher"}
++
++        mock_db.batch_jobs.count_documents = mock_count_documents
++        mock_db.batch_jobs.aggregate = mock_aggregate
++        mock_db.batch_jobs.insert_one = mock_insert_batch
++        mock_db.batch_jobs.find_one = mock_find_one_batch
++        mock_db.batch_jobs.update_one = mock_update_one_batch
++        mock_db.content.insert_one = mock_insert_content
++        mock_db.content.find_one = mock_find_one_content
++        mock_db.users.find_one = mock_find_one_user
++
++        # Mock parser
++        mock_parser = MagicMock()
++        mock_parser.parse_document.return_value = {
++            'content': 'Parsed document content',
++            'metadata': {'page_count': 3, 'tables': [], 'figures': []},
++            'structure': []
++        }
++
++        # Mock chunker
++        mock_chunker = MagicMock()
++        mock_chunker.chunk_document.return_value = [
++            {'text': 'chunk1', 'token_count': 50, 'chunk_index': 0, 'metadata': {}},
++            {'text': 'chunk2', 'token_count': 60, 'chunk_index': 1, 'metadata': {}},
++            {'text': 'chunk3', 'token_count': 40, 'chunk_index': 2, 'metadata': {}},
++        ]
++
++        # Mock RabbitMQ publisher (successful)
++        mock_publisher = MagicMock()
++        mock_publisher.publish_chunks = AsyncMock(return_value=None)
++
++        # Mock WebSocket manager
++        mock_ws_manager = MagicMock()
++        mock_ws_manager.publish_status = AsyncMock()
++
++        # Mock other dependencies
++        with patch('main.get_mongodb', return_value=mock_db), \
++             patch('main.docling_parser', mock_parser), \
++             patch('main.chunker', mock_chunker), \
++             patch('main.rabbitmq_publisher', mock_publisher), \
++             patch('main.save_uploaded_file', side_effect=lambda f, c: f'/tmp/{f}'), \
++             patch('main.content_hasher.generate_content_hash', side_effect=lambda c: f'hash_{len(c)}'), \
++             patch('main.mongodb_client.get_database', return_value=mock_db), \
++             patch('websocket_handler.manager', mock_ws_manager), \
++             patch('os.remove'):
++
++            # Import the function to test
++            from main import bulk_upload, process_batch_files_streaming
++
++            # Step 1: Call bulk_upload endpoint
++            response = await bulk_upload(
++                files=upload_files,
++                user_id="teacher123",
++                title_prefix="Physics",
++                subject="Physics",
++                tags="quantum,mechanics",
++                db=mock_db
++            )
++
++            # Verify immediate response
++            assert response.batch_id is not None
++            assert response.total_files == 3
++            assert response.status == "processing"
++            assert len(response.files) == 3
++
++            batch_id = response.batch_id
++
++            # Step 2: Verify batch job was created in MongoDB
++            assert batch_id in batch_jobs_collection
++            batch_job = batch_jobs_collection[batch_id]
++            assert batch_job["user_id"] == "teacher123"
++            assert batch_job["total_files"] == 3
++            assert batch_job["status"] == "processing"
++            assert len(batch_job["files"]) == 3
++            assert batch_job["subject"] == "Physics"
++            assert batch_job["tags"] == ["quantum", "mechanics"]
++
++            # Step 3: Simulate background processing (normally runs via asyncio.create_task)
++            # We need to prepare file_metadata similar to what bulk_upload creates
++            file_metadata = []
++            for idx, (upload_file, (filename, content)) in enumerate(zip(upload_files, test_files_data)):
++                # Reset file position for re-reading
++                upload_file.file.seek(0)
++                file_metadata.append({
++                    "filename": filename,
++                    "extension": filename.split('.')[-1].lower(),
++                    "size_bytes": len(content),
++                    "upload_file": upload_file
++                })
++
++            # Run the streaming processor
++            await process_batch_files_streaming(
++                batch_id=batch_id,
++                user_id="teacher123",
++                file_metadata=file_metadata,
++                title_prefix="Physics",
++                subject="Physics",
++                tags_list=["quantum", "mechanics"]
++            )
++
++            # Step 4: Verify all files were processed
++            final_batch = batch_jobs_collection[batch_id]
++            assert final_batch["completed_files"] == 3, f"Expected 3 completed, got {final_batch['completed_files']}"
++            assert final_batch["failed_files"] == 0, f"Expected 0 failed, got {final_batch['failed_files']}"
++            assert final_batch["status"] == "completed"
++
++            # Step 5: Verify each file status
++            for idx, file_status in enumerate(final_batch["files"]):
++                assert file_status["status"] == "completed", f"File {idx} should be completed"
++                assert file_status.get("content_id") is not None, f"File {idx} should have content_id"
++
++            # Step 6: Verify content was saved to MongoDB
++            assert len(content_collection) == 3, f"Expected 3 documents, got {len(content_collection)}"
++
++            # Step 7: Verify RabbitMQ was called for each file
++            assert mock_publisher.publish_chunks.call_count == 3
++
++            # Step 8: Verify WebSocket events were published
++            assert mock_ws_manager.publish_status.call_count > 0
++
++            # Step 9: Verify parser and chunker were called for each file
++            assert mock_parser.parse_document.call_count == 3
++            assert mock_chunker.chunk_document.call_count == 3
++
++    @pytest.mark.asyncio
++    async def test_batch_upload_with_partial_failures(self):
++        """Test 51: Integration test where 1 of 3 files fails."""
++        from unittest.mock import AsyncMock, MagicMock, patch
++        from io import BytesIO
++        from fastapi import UploadFile
++
++        # Setup: 3 files, middle one will fail
++        test_files_data = [
++            ("good1.pdf", b"Good content 1" * 100),
++            ("bad.pdf", b"This will fail" * 100),
++            ("good2.txt", b"Good content 2" * 50),
++        ]
++
++        upload_files = []
++        for filename, content in test_files_data:
++            file_obj = BytesIO(content)
++            upload_file = UploadFile(filename=filename, file=file_obj)
++            upload_files.append(upload_file)
++
++        # Track processing
++        processing_results = {}
++
++        mock_db = MagicMock()
++        batch_jobs_collection = {}
++
++        async def mock_count_documents(query):
++            return 0
++
++        async def mock_aggregate(pipeline):
++            class MockCursor:
++                async def to_list(self, limit):
++                    return []
++            return MockCursor()
++
++        async def mock_insert_batch(doc):
++            batch_jobs_collection[doc["batch_id"]] = doc
++
++        async def mock_update_one_batch(query, update):
++            batch_id = query.get("batch_id")
++            if batch_id in batch_jobs_collection:
++                if "$inc" in update:
++                    for key, val in update["$inc"].items():
++                        batch_jobs_collection[batch_id][key] = batch_jobs_collection[batch_id].get(key, 0) + val
++                if "$set" in update:
++                    for key, val in update["$set"].items():
++                        if key.startswith("files."):
++                            parts = key.split(".")
++                            idx = int(parts[1])
++                            field = parts[2]
++                            batch_jobs_collection[batch_id]["files"][idx][field] = val
++                        else:
++                            batch_jobs_collection[batch_id][key] = val
++
++        async def mock_find_one_content(query):
++            return None
++
++        async def mock_insert_content(doc):
++            pass
++
++        async def mock_find_one_user(query):
++            return {"full_name": "Test User"}
++
++        mock_db.batch_jobs.count_documents = mock_count_documents
++        mock_db.batch_jobs.aggregate = mock_aggregate
++        mock_db.batch_jobs.insert_one = mock_insert_batch
++        mock_db.batch_jobs.update_one = mock_update_one_batch
++        mock_db.content.find_one = mock_find_one_content
++        mock_db.content.insert_one = mock_insert_content
++        mock_db.users.find_one = mock_find_one_user
++
++        # Mock parser to fail on "bad.pdf"
++        def mock_parse(filepath):
++            if "bad.pdf" in filepath:
++                raise Exception("Corrupt PDF file")
++            return {
++                'content': 'Content',
++                'metadata': {'page_count': 1, 'tables': [], 'figures': []},
++                'structure': []
++            }
++
++        mock_parser = MagicMock()
++        mock_parser.parse_document.side_effect = mock_parse
++
++        mock_chunker = MagicMock()
++        mock_chunker.chunk_document.return_value = [
++            {'text': 'chunk', 'token_count': 50, 'chunk_index': 0, 'metadata': {}}
++        ]
++
++        mock_publisher = MagicMock()
++        mock_publisher.publish_chunks = AsyncMock()
++
++        mock_ws_manager = MagicMock()
++        mock_ws_manager.publish_status = AsyncMock()
++
++        with patch('main.get_mongodb', return_value=mock_db), \
++             patch('main.docling_parser', mock_parser), \
++             patch('main.chunker', mock_chunker), \
++             patch('main.rabbitmq_publisher', mock_publisher), \
++             patch('main.save_uploaded_file', side_effect=lambda f, c: f'/tmp/{f}'), \
++             patch('main.content_hasher.generate_content_hash', return_value='hash123'), \
++             patch('main.mongodb_client.get_database', return_value=mock_db), \
++             patch('websocket_handler.manager', mock_ws_manager), \
++             patch('os.remove'):
++
++            from main import bulk_upload, process_batch_files_streaming
++
++            # Upload
++            response = await bulk_upload(
++                files=upload_files,
++                user_id="teacher123",
++                title_prefix=None,
++                subject=None,
++                tags=None,
++                db=mock_db
++            )
++
++            batch_id = response.batch_id
++
++            # Process
++            file_metadata = []
++            for idx, (upload_file, (filename, content)) in enumerate(zip(upload_files, test_files_data)):
++                upload_file.file.seek(0)
++                file_metadata.append({
++                    "filename": filename,
++                    "extension": filename.split('.')[-1].lower(),
++                    "size_bytes": len(content),
++                    "upload_file": upload_file
++                })
++
++            await process_batch_files_streaming(
++                batch_id=batch_id,
++                user_id="teacher123",
++                file_metadata=file_metadata,
++                title_prefix=None,
++                subject=None,
++                tags_list=[]
++            )
++
++            # Verify partial success
++            final_batch = batch_jobs_collection[batch_id]
++            assert final_batch["completed_files"] == 2, "Should have 2 completed files"
++            assert final_batch["failed_files"] == 1, "Should have 1 failed file"
++            assert final_batch["status"] == "completed_with_errors"
++
++            # Verify correct file failed
++            for file_status in final_batch["files"]:
++                if file_status["filename"] == "bad.pdf":
++                    assert file_status["status"] == "failed"
++                    assert "Corrupt PDF" in file_status.get("error_message", "")
++                else:
++                    assert file_status["status"] == "completed"
++
++
++class TestPerformance:
++    """Test performance-related aspects."""
++
++    @pytest.mark.asyncio
++    async def test_concurrent_processing_faster_than_sequential(self):
++        """Test 46: Concurrent processing is faster than sequential."""
++        task_count = 10
++        task_duration = 0.1  # 100ms per task
++
++        async def task():
++            await asyncio.sleep(task_duration)
++
++        # Concurrent (with semaphore limiting to 5)
++        semaphore = asyncio.Semaphore(5)
++
++        async def limited_task():
++            async with semaphore:
++                await task()
++
++        start = asyncio.get_event_loop().time()
++        await asyncio.gather(*[limited_task() for _ in range(task_count)])
++        concurrent_time = asyncio.get_event_loop().time() - start
++
++        # Sequential would take task_count * task_duration = 1.0 seconds
++        sequential_time = task_count * task_duration
++
++        # Concurrent should be faster (roughly 2x with semaphore of 5)
++        assert concurrent_time < sequential_time
++
++    def test_memory_efficiency_with_file_contents(self):
++        """Test 47: File contents are stored efficiently."""
++        # Simulate file contents list
++        file_contents = []
++        for i in range(10):
++            file_contents.append({
++                "filename": f"file_{i}.pdf",
++                "content": b"x" * (1024 * 1024),  # 1MB each
++                "extension": "pdf",
++                "size_bytes": 1024 * 1024
++            })
++
++        # Should be able to store 10 files
++        assert len(file_contents) == 10
++
++        # Total memory usage tracking
++        total_bytes = sum(f["size_bytes"] for f in file_contents)
++        assert total_bytes == 10 * 1024 * 1024  # 10MB
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])

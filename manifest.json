@@ -1,0 +1,25 @@
+{
+  "expert_name": "Zishan Jawed",
+  "task_id": "1135",
+  "timestamp": "2025-11-13T12:25:31.092957+00:00",
+  "repo_url": "git@github.com:zishanjawed/RAG-Edtech.git",
+  "assignments": {
+    "model_b": "claude-sonnet-4-5-20250929",
+    "model_a": "claude-kapok-v6-p"
+  },
+  "code_names": {
+    "model_b": "bear",
+    "model_a": "panther"
+  },
+  "model_config": {
+    "static_model": "claude-sonnet-4-5-20250929",
+    "chosen_model": "claude-kapok-v6-p"
+  },
+  "setup_verified": true,
+  "experiment_metadata": {
+    "setup_script_version": "2.1.0-v2",
+    "platform": "Darwin",
+    "claude_version_downloaded": "2025-11-13",
+    "setup_duration_seconds": 51.7
+  }
+}
